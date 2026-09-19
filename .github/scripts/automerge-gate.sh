@@ -72,7 +72,8 @@ merge_now() {
   # re-read immediately before every merge attempt, because the merge token
   # is an administrator's and branch protection would not re-check for it.
   for ATTEMPT in 1 2 3; do
-    MS=$(gh pr view "$PR" --repo "$REPO" --json mergeStateStatus,headRefOid --jq '"\(.mergeStateStatus) \(.headRefOid)"' 2>/dev/null) || MS="PROBE_FAILED -"
+    MS=$(gh pr view "$PR" --repo "$REPO" --json mergeStateStatus,headRefOid --jq '"\(.mergeStateStatus) \(.headRefOid)"' 2>/dev/null) || MS=""
+    [ -n "$MS" ] || { say "::warning::Not merged: could not read the merge state of #$PR (API failure); the next completion re-evaluates"; return 0; }
     STATE=${MS%% *}; NOW_SHA=${MS##* }
     [ "$NOW_SHA" = "$HEAD_SHA" ] || { say "Not merged: the head moved from $HEAD_SHA to $(clean "$NOW_SHA") while evaluating"; return 0; }
     if [ "$STATE" = "UNKNOWN" ]; then [ "$ATTEMPT" -lt 3 ] && sleep 15; continue; fi
@@ -81,7 +82,21 @@ merge_now() {
       say "::notice::Not merged: merge state is $(clean "$STATE") at $HEAD_SHA ($(clean "${ROLLUP:-no failing or pending checks listed}")); the next completion re-evaluates"
       return 0
     fi
-    if [ "$DRY_RUN" = "1" ]; then say "DRY_RUN: would merge #$PR at $HEAD_SHA (merge state CLEAN)"; return 0; fi
+    # The merge state is not the only witness: every status check that branch
+    # protection requires must be green at this head, read from the checks
+    # themselves, because the merge token is an administrator's.
+    REQUIRED_CTX=$(gh api "repos/$REPO/branches/$BASE_REF/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null) || { say "::warning::Not merged: could not read the required status checks"; return 0; }
+    ROLLUP_JSON=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '.statusCheckRollup' 2>/dev/null) || { say "::warning::Not merged: could not read the checks"; return 0; }
+    MISSING=""
+    while IFS= read -r CTX; do
+      [ -n "$CTX" ] || continue
+      OK=$(printf '%s' "$ROLLUP_JSON" | jq -r --arg c "$CTX" '[.[] | select((.name // .context) == $c) | (.conclusion // .state // "")] | if length == 0 then "absent" elif all(. == "SUCCESS" or . == "SKIPPED" or . == "NEUTRAL") then "ok" else join(",") end')
+      [ "$OK" = "ok" ] || MISSING="$MISSING $CTX=$OK"
+    done <<EOF_CTX
+$REQUIRED_CTX
+EOF_CTX
+    [ -z "$MISSING" ] || { say "::notice::Not merged: required checks not green at $HEAD_SHA:$(clean "$MISSING"); the next completion re-evaluates"; return 0; }
+    if [ "$DRY_RUN" = "1" ]; then say "DRY_RUN: would merge #$PR at $HEAD_SHA (merge state CLEAN, required checks green)"; return 0; fi
     OUT=$(gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$HEAD_SHA" 2>&1) && { say "Merged #$PR at $HEAD_SHA"; return 0; }
     say "::notice::merge attempt $ATTEMPT/3 refused: $(clean "$OUT")"
     [ "$ATTEMPT" -lt 3 ] && sleep 15
@@ -114,7 +129,9 @@ case "$N_FILES" in ''|*[!0-9]*) disarm "could not determine the PR's file count 
 
 # ── the PR's files: a PR-controlled workflow definition is never armed ─────
 if [ "$N_FILES" -gt 3000 ]; then disarm "PR changes $N_FILES files, more than the files API lists; manual merge required"; exit 0; fi
-CHANGED=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' 2>/dev/null) || { disarm "could not list the PR files"; exit 0; }
+# Both names of a renamed file count: moving a workflow out of .github/ is a
+# change to the workflow surface, and the new name alone would not show it.
+CHANGED=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' 2>/dev/null) || { disarm "could not list the PR files"; exit 0; }
 SURFACE_RE='^\.github/|(^|/)CLAUDE\.md$|(^|/)AGENTS\.md$|(^|/)\.claude/|^\.mcp\.json$|^action\.ya?ml$'
 WF_CHANGE=$(printf '%s\n' "$CHANGED" | grep -m1 -E "$SURFACE_RE" || true)
 if [ -n "$WF_CHANGE" ]; then
@@ -146,9 +163,11 @@ done
 if [ "$DEPENDABOT" = "1" ]; then
   TITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title 2>/dev/null) || { disarm "could not read the PR title"; exit 0; }
   TIER=unknown
-  if printf '%s' "$TITLE" | grep -qE '[Bb]ump [^ ]+( [^ ]+)* from [0-9][0-9A-Za-z.+-]* to [0-9][0-9A-Za-z.+-]*$'; then
-    OLD=$(printf '%s' "$TITLE" | sed -E 's/.* from ([0-9][0-9A-Za-z.+-]*) to [0-9][0-9A-Za-z.+-]*$/\1/')
-    NEW=$(printf '%s' "$TITLE" | sed -E 's/.* to ([0-9][0-9A-Za-z.+-]*)$/\1/')
+  # Same rule as dependency-review.yml's classifier: a full X.Y.Z on both sides,
+  # anything else is unknown and merged by hand.
+  if printf '%s' "$TITLE" | grep -qE '[Bb]ump [^ ]+( [^ ]+)* from [0-9]+\.[0-9]+\.[0-9]+ to [0-9]+\.[0-9]+\.[0-9]+$'; then
+    OLD=$(printf '%s' "$TITLE" | sed -E 's/.* from ([0-9]+\.[0-9]+\.[0-9]+) to [0-9]+\.[0-9]+\.[0-9]+$/\1/')
+    NEW=$(printf '%s' "$TITLE" | sed -E 's/.* to ([0-9]+\.[0-9]+\.[0-9]+)$/\1/')
     if [ "$(printf '%s' "$OLD" | cut -d. -f1)" != "$(printf '%s' "$NEW" | cut -d. -f1)" ]; then TIER=major
     elif [ "$(printf '%s' "$OLD" | cut -d. -f2)" != "$(printf '%s' "$NEW" | cut -d. -f2)" ]; then TIER=minor
     else TIER=patch; fi
