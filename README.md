@@ -137,7 +137,7 @@ tool if you want the reason fed back to the model as an error result rather
 than raised), and an `updated_input` from the edge replaces the arguments
 before the wrapped tool runs.
 
-Two honest limits:
+Two limits:
 
 - **Coverage is what you hand it.** A tool that did not go through `govern`
   is invisible to the adapter and to the attestation. `govern_tools` is the
