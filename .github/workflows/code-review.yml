@@ -88,8 +88,16 @@ jobs:
             - Type hints hold under mypy --strict and the change keeps Python 3.10 compatibility
 
             When you are done, return your result as the JSON object required by the schema: review_body (markdown) and verdict.
-            For review_body: 1) brief summary (2-3 sentences), 2) any issues as bullet points, 3) note if code looks good.
-            For verdict: use APPROVE if acceptable (minor suggestions OK), REQUEST_CHANGES only for blocking issues.
+            For review_body: 1) brief summary (2-3 sentences), 2) any issues as bullet points with severity tags, 3) note if code looks good.
+            For verdict: use APPROVE or REQUEST_CHANGES per the rules below.
+
+            Verdict rules — this is critical because REQUEST_CHANGES blocks merging:
+            - APPROVE: Code is correct, or has only minor/informational items. Include suggestions in the review body.
+            - REQUEST_CHANGES: ONLY for genuine bugs, security vulnerabilities, or code that will break at runtime.
+            - Things that are NOT blocking: intentional removals/renames (the author knows what they changed),
+              "confirm this is intentional" questions, style preferences, missing tests for non-critical code,
+              suggestions for future improvement, and items outside the diff (e.g. modules not shown).
+            - When in doubt, APPROVE with comments. The PR author can address feedback without being blocked.
 
             Be concise and actionable. Do not pad or repeat the checklist.
 
