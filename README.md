@@ -16,11 +16,12 @@ Contract: [iag-specs/sentinel/adapters.md](https://github.com/mitrity-io/iag-spe
 
 ## Install
 
-Until the first PyPI release, install from git at a pinned ref:
+Until the first PyPI release, install from git at a pinned ref (a release tag
+once one exists, a commit SHA until then):
 
 ```bash
-pip install "mitrity[claude-agent-sdk] @ git+https://github.com/mitrity-io/mitrity-python.git@v0.1.0"
-pip install "mitrity[langchain] @ git+https://github.com/mitrity-io/mitrity-python.git@v0.1.0"
+pip install "mitrity[claude-agent-sdk] @ git+https://github.com/mitrity-io/mitrity-python.git@<ref>"
+pip install "mitrity[langchain] @ git+https://github.com/mitrity-io/mitrity-python.git@<ref>"
 ```
 
 Python ≥ 3.10. The only runtime dependency is `httpx`; the framework extras
