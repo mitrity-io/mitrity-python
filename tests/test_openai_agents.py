@@ -46,17 +46,27 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
 )
+from openai.types.responses.response_apply_patch_tool_call import (
+    OperationDeleteFile,
+    ResponseApplyPatchToolCall,
+)
+from openai.types.responses.response_function_shell_tool_call import (
+    Action,
+    ResponseFunctionShellToolCall,
+)
 from openai.types.responses.response_output_item import LocalShellCall, LocalShellCallAction
 
 from mitrity.admission import Client
 from mitrity.openai_agents import (
     GUARDRAIL_NAME,
+    HOSTED_TOOL_TYPES,
     MitrityDenied,
     OpenAIAgentsGovernor,
     govern,
     govern_tools,
+    input_digest,
 )
-from tests.fake_edge import FakeEdge, allow, deny
+from tests.fake_edge import FakeEdge, allow, deny, held
 
 T = TypeVar("T")
 
@@ -149,10 +159,61 @@ def function_call(call_id: str, command: str) -> ResponseFunctionToolCall:
     )
 
 
-class StubModel(Model):
-    """Answers with a function call, then with a message: enough for one governed tool call."""
+def shell_call(call_id: str, commands: list[str]) -> ResponseFunctionShellToolCall:
+    """A shell call as the Responses API emits it: what the SDK builds its approval item from."""
+    return ResponseFunctionShellToolCall(
+        id=f"sh_item_{call_id}",
+        call_id=call_id,
+        action=Action(commands=commands),
+        status="completed",
+        type="shell_call",
+    )
 
-    def __init__(self, call: ResponseFunctionToolCall) -> None:
+
+def apply_patch_call(call_id: str, path: str) -> ResponseApplyPatchToolCall:
+    """An apply_patch call as the API emits it: what the SDK builds its approval item from."""
+    return ResponseApplyPatchToolCall(
+        id=f"ap_item_{call_id}",
+        call_id=call_id,
+        operation=OperationDeleteFile(path=path, type="delete_file"),
+        status="completed",
+        type="apply_patch_call",
+    )
+
+
+def local_shell_call(call_id: str, command: list[str]) -> LocalShellCall:
+    return LocalShellCall(
+        id=call_id,
+        call_id=call_id,
+        action=LocalShellCallAction(command=command, env={}, type="exec"),
+        status="completed",
+        type="local_shell_call",
+    )
+
+
+class RecordingEditor:
+    """An apply_patch editor that records what it applied."""
+
+    def __init__(self) -> None:
+        self.applied: list[tuple[str, str]] = []
+
+    def create_file(self, operation: ApplyPatchOperation) -> str:
+        self.applied.append(("create_file", operation.path))
+        return "created"
+
+    def update_file(self, operation: ApplyPatchOperation) -> str:
+        self.applied.append(("update_file", operation.path))
+        return "updated"
+
+    def delete_file(self, operation: ApplyPatchOperation) -> str:
+        self.applied.append(("delete_file", operation.path))
+        return "deleted"
+
+
+class StubModel(Model):
+    """Answers with one tool call, then with a message: enough for one governed tool call."""
+
+    def __init__(self, call: Any) -> None:
         self._call = call
         self.turns = 0
 
@@ -173,7 +234,7 @@ class StubModel(Model):
         raise NotImplementedError
 
 
-async def run_through_runner(agent: Agent[Any], call: ResponseFunctionToolCall) -> list[Any]:
+async def run_through_runner(agent: Agent[Any], call: Any) -> list[Any]:
     run_config = RunConfig(model=StubModel(call), tracing_disabled=True)
     result = await Runner.run(agent, "go", run_config=run_config)
     return [item.output for item in result.new_items if isinstance(item, ToolCallOutputItem)]
@@ -406,13 +467,7 @@ async def test_c23_local_shell_deny_is_the_output(edge: FakeEdge, client: Client
         return "ok"
 
     tool = only(govern_tools([LocalShellTool(executor=executor)], client=client), LocalShellTool)
-    call = LocalShellCall(
-        id="lsh_1",
-        call_id="lsh_1",
-        action=LocalShellCallAction(command=["rm", "-rf", "/"], env={}, type="exec"),
-        status="completed",
-        type="local_shell_call",
-    )
+    call = local_shell_call("lsh_1", ["rm", "-rf", "/"])
     edge.script(deny("local shell said no"))
     output = await run_local_shell(tool, call)
     assert "local shell said no" in output and ran == []
@@ -519,6 +574,347 @@ def test_model_settings_untouched(client: Client) -> None:
     assert governed.model_settings == agent.model_settings and governed.name == "a"
 
 
+# -------------------------------------------- judged bytes are the executed bytes
+
+
+def test_input_digest_is_canonical_and_fails_closed() -> None:
+    assert input_digest({"a": 1, "b": [1, 2]}) == input_digest({"b": [1, 2], "a": 1})
+    assert input_digest({"a": 1}) != input_digest({"a": 1.0})
+    assert input_digest({"a": "x"}) != input_digest({"a": "y"})
+    assert input_digest({"ratio": 0.5}) is not None, "floats are judged inputs too"
+    assert input_digest({"a": object()}) is None
+
+
+@pytest.mark.anyio
+async def test_invoker_blocks_an_input_that_differs_from_the_judged_one(
+    edge: FakeEdge, client: Client
+) -> None:
+    governor = OpenAIAgentsGovernor(client=client)
+    tool = only(govern_tools([run_command], governor=governor), FunctionTool)
+    ctx = tool_context(tool, {"command": "ls"})
+    await run_guardrail(tool, ctx)
+    with pytest.raises(MitrityDenied, match="different input"):
+        await tool.on_invoke_tool(ctx, json.dumps({"command": "rm -rf /"}))
+    assert len(edge.admits()) == 1, "the swapped input is blocked, not re-admitted"
+    assert governor.stats.mismatched == 1
+    # The allow the guardrail left is gone with it: the call id must be judged again.
+    edge.script(deny("judged afresh"))
+    with pytest.raises(MitrityDenied, match="judged afresh"):
+        await tool.on_invoke_tool(ctx, json.dumps({"command": "ls"}))
+    assert len(edge.admits()) == 2
+
+
+@pytest.mark.anyio
+async def test_shell_executor_blocks_an_action_that_differs_from_the_judged_one(
+    edge: FakeEdge, client: Client
+) -> None:
+    ran: list[list[str]] = []
+
+    def executor(request: ShellCommandRequest) -> str:
+        ran.append(list(request.data.action.commands))
+        return "ok"
+
+    tool = only(govern_tools([ShellTool(executor=executor)], client=client), ShellTool)
+    assert await needs_approval(tool, ShellActionRequest(commands=["ls"]), "sh_9") is False
+    with pytest.raises(MitrityDenied, match="different input"):
+        await run_shell(tool, ["rm -rf /"], "sh_9")
+    assert ran == [] and len(edge.admits()) == 1
+
+
+@pytest.mark.anyio
+async def test_verdicts_are_kept_per_tool(edge: FakeEdge, client: Client) -> None:
+    @function_tool
+    def write_file(path: str) -> str:
+        """Write."""
+        return f"wrote {path}"
+
+    governor = OpenAIAgentsGovernor(client=client)
+    runner = only(govern_tools([run_command], governor=governor), FunctionTool)
+    writer = only(govern_tools([write_file], governor=governor), FunctionTool)
+    ctx = tool_context(runner, {"command": "ls"}, call_id="shared")
+    await run_guardrail(runner, ctx)
+    # Same call id, other tool: the allow decided for run_command is not the writer's to consume.
+    edge.script(deny("writer said no"))
+    with pytest.raises(MitrityDenied, match="writer said no"):
+        await writer.on_invoke_tool(
+            tool_context(writer, {"path": "/x"}, call_id="shared"), json.dumps({"path": "/x"})
+        )
+    assert len(edge.admits()) == 2
+    assert await runner.on_invoke_tool(ctx, json.dumps({"command": "ls"})) == "ran ls"
+    assert len(edge.admits()) == 2, "run_command's own decision was still there"
+
+
+@pytest.mark.anyio
+async def test_a_guardrail_deny_replaces_an_earlier_allow_for_the_call(
+    edge: FakeEdge, client: Client
+) -> None:
+    tool = only(govern_tools([run_command], client=client), FunctionTool)
+    ctx = tool_context(tool, {"command": "ls"})
+    await run_guardrail(tool, ctx)
+    edge.script(deny("second look"))
+    output = await run_guardrail(tool, ctx)
+    assert output.behavior["type"] == "reject_content"
+    with pytest.raises(MitrityDenied, match="second look"):
+        await tool.on_invoke_tool(ctx, json.dumps({"command": "ls"}))
+    assert len(edge.admits()) == 2
+
+
+@pytest.mark.anyio
+async def test_needs_approval_reuses_the_decision_for_the_same_call_and_bytes(
+    edge: FakeEdge, client: Client
+) -> None:
+    # The SDK evaluates needs_approval at planning and again at execution on a
+    # resumed turn: one call, one decision.
+    tool = only(govern_tools([ShellTool(executor=lambda request: "ok")], client=client), ShellTool)
+    action = ShellActionRequest(commands=["ls"])
+    assert await needs_approval(tool, action, "sh_r") is False
+    assert await needs_approval(tool, action, "sh_r") is False
+    assert len(edge.admits()) == 1
+    # Other bytes under the same call id are a new decision.
+    edge.script(deny("other bytes"))
+    assert await needs_approval(tool, ShellActionRequest(commands=["rm -rf /"]), "sh_r") is True
+    assert len(edge.admits()) == 2
+
+
+# ------------------------------------------------------------------- approvals
+
+
+@pytest.mark.anyio
+async def test_c23_on_approval_rejects_an_item_it_cannot_correlate(
+    edge: FakeEdge, client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    approved: list[str] = []
+
+    async def auto_approve(ctx: RunContextWrapper[Any], item: ToolApprovalItem) -> Any:
+        approved.append(item.tool_name or "?")
+        return {"approve": True}
+
+    governor = OpenAIAgentsGovernor(client=client)
+    shell = only(
+        govern_tools(
+            [ShellTool(executor=lambda request: "ok", on_approval=auto_approve)],
+            governor=governor,
+        ),
+        ShellTool,
+    )
+    patch = only(
+        govern_tools(
+            [ApplyPatchTool(editor=RecordingEditor(), on_approval=auto_approve)],
+            governor=governor,
+        ),
+        ApplyPatchTool,
+    )
+    no_id = cast("Any", {"type": "shell_call"})
+    with caplog.at_level(logging.WARNING, logger="mitrity.openai_agents"):
+        for tool in (shell, patch):
+            fn = tool.on_approval
+            assert fn is not None
+            # A call nothing judged.
+            decision = dict(
+                await maybe(fn(ctx_wrapper(), approval_item("never_judged", tool.name)))
+            )
+            assert decision["approve"] is False and "could not correlate" in decision["reason"]
+            # An item with no call id at all.
+            item = ToolApprovalItem(agent=Agent(name="a"), raw_item=no_id, tool_name=tool.name)
+            decision = dict(await maybe(fn(ctx_wrapper(), item)))
+            assert decision["approve"] is False and "could not correlate" in decision["reason"]
+    assert approved == [], "the developer's auto-approval is never asked about an uncorrelated item"
+    assert governor.stats.uncorrelated == 4
+    assert edge.admits() == []
+    assert "could not correlate" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_c23_shell_approval_correlates_the_sdk_item_through_the_runner(
+    edge: FakeEdge, client: Client
+) -> None:
+    ran: list[list[str]] = []
+
+    def executor(request: ShellCommandRequest) -> str:
+        ran.append(list(request.data.action.commands))
+        return "ok"
+
+    agent = govern(
+        Agent(name="a", instructions="do", tools=[ShellTool(executor=executor)]), client=client
+    )
+    edge.script(deny("shell policy said no"))
+    outputs = await run_through_runner(agent, shell_call("sh_run_1", ["rm -rf /"]))
+    assert len(outputs) == 1 and "shell policy said no" in str(outputs[0])
+    assert ran == []
+    request = edge.admits()[0].body
+    assert request["tool_use_id"] == "sh_run_1"
+    assert request["tool_input"] == {"commands": ["rm -rf /"]}
+    # An allow runs the developer's executor on the one decision needs_approval made.
+    outputs = await run_through_runner(agent, shell_call("sh_run_2", ["ls"]))
+    assert outputs == ["ok"] and ran == [["ls"]]
+    assert len(edge.admits()) == 2
+
+
+@pytest.mark.anyio
+async def test_c23_apply_patch_approval_correlates_the_sdk_item_through_the_runner(
+    edge: FakeEdge, client: Client
+) -> None:
+    editor = RecordingEditor()
+    agent = govern(
+        Agent(name="a", instructions="do", tools=[ApplyPatchTool(editor=editor)]), client=client
+    )
+    edge.script(deny("patch policy said no"))
+    outputs = await run_through_runner(agent, apply_patch_call("ap_run_1", "/etc/passwd"))
+    assert len(outputs) == 1 and "patch policy said no" in str(outputs[0])
+    assert editor.applied == []
+    request = edge.admits()[0].body
+    assert request["tool_use_id"] == "ap_run_1"
+    assert request["tool_input"] == {"type": "delete_file", "path": "/etc/passwd"}
+    # An allow reaches the developer's editor on the one decision needs_approval made.
+    outputs = await run_through_runner(agent, apply_patch_call("ap_run_2", "/tmp/stale"))
+    assert outputs == ["deleted"] and editor.applied == [("delete_file", "/tmp/stale")]
+    assert len(edge.admits()) == 2
+
+
+@pytest.mark.anyio
+async def test_c23_apply_patch_editor_enforces_the_decision(edge: FakeEdge, client: Client) -> None:
+    editor = RecordingEditor()
+    tool = only(govern_tools([ApplyPatchTool(editor=editor)], client=client), ApplyPatchTool)
+    assert tool.editor is not editor, "the editor is wrapped: the execution channel is gated too"
+    op = ApplyPatchOperation(type="delete_file", path="/etc/passwd")
+    edge.script(deny("patch said no"))
+    assert await needs_approval(tool, op, "ap_e1") is True
+    # The approval channel was bypassed (an auto-approving host): the editor still refuses.
+    with pytest.raises(MitrityDenied, match="patch said no"):
+        await maybe(tool.editor.delete_file(op))
+    assert editor.applied == [] and len(edge.admits()) == 1
+    # An allowed operation reaches the developer's editor on the decision needs_approval made.
+    create = ApplyPatchOperation(type="create_file", path="/tmp/x", diff="+hi")
+    assert await needs_approval(tool, create, "ap_e2") is False
+    assert await maybe(tool.editor.create_file(create)) == "created"
+    assert editor.applied == [("create_file", "/tmp/x")]
+    assert len(edge.admits()) == 2, "the editor reuses the decision needs_approval made"
+    # An operation nothing judged (an approved call on a resumed run skips
+    # needs_approval) is admitted by the editor itself.
+    update = ApplyPatchOperation(type="update_file", path="/tmp/y", diff="+yo")
+    edge.script(deny("editor said no"))
+    with pytest.raises(MitrityDenied, match="editor said no"):
+        await maybe(tool.editor.update_file(update))
+    assert edge.admits()[2].body["tool_input"] == {
+        "type": "update_file",
+        "path": "/tmp/y",
+        "diff": "+yo",
+    }
+    assert await maybe(tool.editor.update_file(update)) == "updated"
+    assert editor.applied[-1] == ("update_file", "/tmp/y")
+    # A rewrite reaching the editor is a deny there as well.
+    edge.script(allow(updated_input={"path": "/elsewhere"}))
+    with pytest.raises(MitrityDenied, match="cannot apply"):
+        await maybe(tool.editor.delete_file(ApplyPatchOperation(type="delete_file", path="/z")))
+    assert editor.applied == [("create_file", "/tmp/x"), ("update_file", "/tmp/y")]
+
+
+@pytest.mark.anyio
+async def test_c23_apply_patch_without_a_usable_editor_is_a_deny(
+    edge: FakeEdge, client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="mitrity.openai_agents"):
+        tool = only(
+            govern_tools([ApplyPatchTool(editor=cast("Any", None))], client=client), ApplyPatchTool
+        )
+    assert "no editor able to" in caplog.text
+    with pytest.raises(MitrityDenied, match="no editor able to delete file"):
+        await maybe(tool.editor.delete_file(ApplyPatchOperation(type="delete_file", path="/x")))
+
+    class ReadOnly:
+        def create_file(self, operation: ApplyPatchOperation) -> str:
+            return "created"
+
+    partial = only(
+        govern_tools([ApplyPatchTool(editor=cast("Any", ReadOnly()))], client=client),
+        ApplyPatchTool,
+    )
+    assert (
+        await maybe(
+            partial.editor.create_file(ApplyPatchOperation(type="create_file", path="/x", diff="+"))
+        )
+        == "created"
+    )
+    with pytest.raises(MitrityDenied, match="no editor able to update file"):
+        await maybe(
+            partial.editor.update_file(ApplyPatchOperation(type="update_file", path="/x", diff="+"))
+        )
+
+
+@pytest.mark.anyio
+async def test_held_is_a_deny_in_every_channel(edge: FakeEdge, client: Client) -> None:
+    edge.default_admit = held("apr-9")
+    governor = OpenAIAgentsGovernor(client=client)
+    tool = only(govern_tools([run_command], governor=governor), FunctionTool)
+    shell = only(
+        govern_tools([ShellTool(executor=lambda request: "ok")], governor=governor), ShellTool
+    )
+    output = await run_guardrail(tool, tool_context(tool, {"command": "ls"}))
+    assert output.behavior["type"] == "reject_content"
+    assert "apr-9" in output.behavior["message"] and "human approval" in output.behavior["message"]
+    assert await needs_approval(shell, ShellActionRequest(commands=["ls"]), "sh_h") is True
+    decision = await on_approval(shell, "sh_h")
+    assert decision["approve"] is False and "apr-9" in decision["reason"]
+    assert governor.stats.held == 2 and governor.stats.allowed == 0
+    # Two calls per decision (G4): the no-wait ask, then the wait with the budget.
+    assert [r.body["hold_timeout_seconds"] for r in edge.admits()] == [0, 2, 0, 2]
+
+
+# ------------------------------------------------------------ local shell rewrites
+
+
+@pytest.mark.anyio
+async def test_c23_local_shell_runs_a_rewritten_command(edge: FakeEdge, client: Client) -> None:
+    ran: list[list[str]] = []
+
+    def executor(request: LocalShellCommandRequest) -> str:
+        ran.append(list(request.data.action.command))
+        return "ok"
+
+    tool = only(govern_tools([LocalShellTool(executor=executor)], client=client), LocalShellTool)
+    edge.script(
+        allow(
+            updated_input={"command": ["mitrity-hook", "exec", "met_5"]}, routed_to="governed_shell"
+        )
+    )
+    assert await run_local_shell(tool, local_shell_call("lsh_2", ["rm", "-rf", "build"])) == "ok"
+    assert ran == [["mitrity-hook", "exec", "met_5"]]
+    # A key the action has no place for: the rewrite is refused and nothing runs.
+    edge.script(allow(updated_input={"commands": ["ls"]}))
+    output = await run_local_shell(tool, local_shell_call("lsh_3", ["ls"]))
+    assert "no place" in output and ran == [["mitrity-hook", "exec", "met_5"]]
+
+
+@pytest.mark.anyio
+async def test_c23_local_shell_rewrite_is_refused_when_the_action_cannot_be_introspected(
+    edge: FakeEdge, client: Client
+) -> None:
+    ran: list[Any] = []
+
+    def executor(request: LocalShellCommandRequest) -> str:
+        ran.append(request.data.action.command)
+        return "ok"
+
+    class OpaqueAction:  # neither model_fields nor model_copy
+        def __init__(self) -> None:
+            self.command = ["rm", "-rf", "/"]
+
+    class OpaqueCall:
+        def __init__(self) -> None:
+            self.call_id = "lsh_4"
+            self.action = OpaqueAction()
+
+    tool = only(govern_tools([LocalShellTool(executor=executor)], client=client), LocalShellTool)
+    request = LocalShellCommandRequest(ctx_wrapper=ctx_wrapper(), data=cast("Any", OpaqueCall()))
+    edge.script(allow(updated_input={"command": ["echo", "safe"]}))
+    output = str(await maybe(tool.executor(request)))
+    assert "cannot introspect" in output and ran == []
+    assert edge.admits()[0].body["tool_input"] == {"command": ["rm", "-rf", "/"]}
+    assert edge.admits()[0].body["tool_use_id"] == "lsh_4"
+    # With nothing to rewrite the same opaque action runs on a plain allow.
+    assert str(await maybe(tool.executor(request))) == "ok" and ran == [["rm", "-rf", "/"]]
+
+
 # -------------------------------------------------------- handoffs and tool types
 
 
@@ -576,3 +972,18 @@ def test_handoff_objects_are_left_as_is_with_a_warning(
         governed = govern(parent, client=client)
     assert governed.handoffs == [built] and isinstance(built, Handoff)
     assert "handoff()" in caplog.text
+
+
+def test_unknown_tool_types_pass_through_as_unhooked_with_a_warning(
+    client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    class Mystery:
+        name = "mystery"
+
+    governor = OpenAIAgentsGovernor(client=client)
+    with caplog.at_level(logging.WARNING, logger="mitrity.openai_agents"):
+        tools = govern_tools([cast("Any", Mystery()), WebSearchTool()], governor=governor)
+    assert isinstance(tools[0], Mystery) and isinstance(tools[1], WebSearchTool)
+    assert governor.unhooked_tools == ("mystery", "web_search")
+    assert "mystery" in caplog.text and "web_search" not in caplog.text
+    assert WebSearchTool in HOSTED_TOOL_TYPES

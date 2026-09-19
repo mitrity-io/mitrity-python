@@ -7,22 +7,28 @@ from ._governed import (
     FRAMEWORK,
     FRAMEWORK_VERSION,
     GUARDRAIL_NAME,
+    HOSTED_TOOL_TYPES,
     SURFACE,
     GovernorStats,
     MitrityDenied,
     OpenAIAgentsGovernor,
+    Recalled,
     govern,
     govern_tools,
+    input_digest,
 )
 
 __all__ = [
     "FRAMEWORK",
     "FRAMEWORK_VERSION",
     "GUARDRAIL_NAME",
+    "HOSTED_TOOL_TYPES",
     "SURFACE",
     "GovernorStats",
     "MitrityDenied",
     "OpenAIAgentsGovernor",
+    "Recalled",
     "govern",
     "govern_tools",
+    "input_digest",
 ]

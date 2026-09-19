@@ -14,11 +14,21 @@ Each tool type is refused the way the SDK itself refuses that type
   a wrapped invoker that runs the edge's ``updated_input`` when it sends one;
 - ``ShellTool`` and ``ApplyPatchTool`` go through the SDK's approval flow:
   ``needs_approval`` admits, ``on_approval`` rejects a denied call with the
-  reason, the wrapped shell executor runs a rewritten action;
+  reason — and an approval it cannot tie to a decision. The execution
+  channel, the shell executor and the apply_patch editor, is wrapped as
+  well: a call the SDK runs without asking (an approved call on a resumed
+  run, a standing approval) is admitted there, and a rewritten shell action
+  is what the developer's executor receives;
 - ``LocalShellTool`` (deprecated upstream) has neither guardrails nor
   approvals, so its executor is wrapped and a deny is its output;
 - hosted tools and ``ComputerTool`` pass through untouched and are attested
   as unhooked, so the coverage posture says what is not governed.
+
+Judged bytes are the executed bytes. A decision is remembered together with
+a digest of the input it was made for, keyed by the tool and the SDK's call
+id; the channel that runs the call reuses it only for that exact input, and
+an execution whose input differs from what the edge judged is blocked rather
+than run under that decision.
 
 Coverage is exactly what is wrapped: a tool that never passed through
 ``govern`` is invisible to the adapter and to the attestation.
@@ -27,6 +37,7 @@ Coverage is exactly what is wrapped: a tool that never passed through
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -34,6 +45,7 @@ import os
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -95,6 +107,16 @@ _ATTEST_RETRY_SECONDS = 30.0
 _PROCESS_SESSION_ID = f"openai-agents-{uuid.uuid4()}"
 _VERDICT_MEMORY = 4096
 _GOVERNED_MARKER = "_mitrity_governed"
+_REASON_LIMIT = 200
+
+_MISMATCH_REASON = (
+    "MITRITY judged a different input for {tool} (call {call_id}) than the one about to run; "
+    "the call was blocked rather than run under a decision made about other bytes"
+)
+_UNCORRELATED_REASON = (
+    "MITRITY could not correlate this {tool} approval (call {call_id}) to a decision it made "
+    "and rejected it; the call was blocked rather than run unjudged"
+)
 
 HOSTED_TOOL_TYPES: tuple[type[Any], ...] = (
     WebSearchTool,
@@ -106,23 +128,30 @@ HOSTED_TOOL_TYPES: tuple[type[Any], ...] = (
 )
 """Tools the adapter cannot judge: they execute in the vendor's cloud, or
 (``ComputerTool``) drive a computer the SDK does not judge. Attested as
-unhooked."""
+unhooked. A tool type outside this tuple and the governed types is passed
+through and attested as unhooked too, with a warning: the honest default for
+a future SDK tool is "not governed", never silence."""
 
 logger = logging.getLogger("mitrity.openai_agents")
 
 
 class MitrityDenied(AgentsException):
-    """A call reached an invoker without having been admitted, and the edge denied it.
+    """A call reached an execution channel and MITRITY would not let it run there.
 
-    Only raised when the guardrail the adapter installed did not run for the
-    call (it was removed after ``govern()``): once that channel is gone there
-    is no gentler one, and a call never runs unadmitted.
+    Raised where the SDK offers no gentler channel than ending the step: an
+    invoker or executor the guardrail or approval did not gate (the guardrail
+    was removed after ``govern()``, the call was approved on a resumed run),
+    an execution whose input differs from the judged one, an apply_patch
+    operation the wrapped editor refuses. A call never runs unadmitted.
     """
 
 
 @dataclass
 class GovernorStats:
-    """Counters a demo or a dashboard can read. Not the audit trail — the edge keeps that."""
+    """Counters a demo or a dashboard can read. Not the audit trail — the edge keeps that.
+
+    Updated under the governor's lock, so concurrent tool calls count exactly.
+    """
 
     admitted: int = 0
     allowed: int = 0
@@ -131,6 +160,44 @@ class GovernorStats:
     unreachable: int = 0
     routed: int = 0
     attestations: int = 0
+    uncorrelated: int = 0
+    """Approval items the adapter could not correlate to a decision; each was rejected."""
+    mismatched: int = 0
+    """Executions whose input differed from the judged input; each was blocked."""
+
+
+@dataclass(frozen=True)
+class Recalled:
+    """What the verdict memory holds for a call and the input about to run.
+
+    ``verdict`` is the decision made for exactly these bytes, ``None`` when
+    nothing judged the call. ``other_input`` says the call *was* judged — for
+    a different input — so the caller must not run under that decision.
+    """
+
+    verdict: Verdict | None = None
+    other_input: bool = False
+
+
+def input_digest(tool_input: Mapping[str, Any]) -> str | None:
+    """SHA-256 of the canonical JSON of a tool input: sorted keys, no whitespace.
+
+    Deliberately not RFC 8785: that canonicalization refuses floats, and a
+    function tool may well take one. Sorted, compact ``json.dumps`` is
+    deterministic for the same value, which is all a same-process comparison
+    needs. ``None`` when the input cannot be serialized at all — nothing is
+    remembered for it, and a comparison against it fails closed.
+    """
+    try:
+        text = json.dumps(tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _bound(text: str) -> str:
+    """Bound text that reaches the model's context, as the client bounds error bodies."""
+    return text if len(text) <= _REASON_LIMIT else text[:_REASON_LIMIT] + "…"
 
 
 class OpenAIAgentsGovernor:
@@ -153,7 +220,12 @@ class OpenAIAgentsGovernor:
         self._hooked: list[str] = []
         self._unhooked: list[str] = []
         self._other_mcp: list[str] = []
-        self._verdicts: dict[str, Verdict] = {}
+        # (tool name, call id) -> digest of the judged input -> the verdict.
+        # One call id carries one input, except apply_patch, whose call may
+        # carry several operations; each is judged and remembered on its own.
+        self._judged: OrderedDict[tuple[str, str], dict[str, Verdict]] = OrderedDict()
+        # (tool name, digest) -> the key above, for a channel with no call id.
+        self._by_input: dict[tuple[str, str], tuple[str, str]] = {}
         self._attested: dict[str, str] = {}
         self._attest_attempted: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -206,26 +278,126 @@ class OpenAIAgentsGovernor:
 
     # ---------------------------------------------------------------- verdicts
 
-    def remember(self, call_id: str | None, verdict: Verdict) -> None:
-        """Keep a decision for the invoker or executor that runs the same call."""
-        if not call_id:
+    def remember(
+        self, tool_name: str, call_id: str | None, tool_input: Mapping[str, Any], verdict: Verdict
+    ) -> None:
+        """Keep a decision, with the digest of the judged input, for the channel that runs the call.
+
+        A deny replaces every earlier verdict for the call: nothing allowed
+        under this id before the refusal survives it.
+        """
+        digest = input_digest(tool_input)
+        if not call_id or digest is None:
             return
+        key = (tool_name, call_id)
         with self._lock:
-            if len(self._verdicts) >= _VERDICT_MEMORY:
-                self._verdicts.pop(next(iter(self._verdicts)))
-            self._verdicts[call_id] = verdict
+            entry = self._judged.get(key)
+            if entry is None or not verdict.allowed:
+                self._forget_locked(key)
+                entry = {}
+                self._judged[key] = entry
+            entry[digest] = verdict
+            self._by_input[(tool_name, digest)] = key
+            while len(self._judged) > _VERDICT_MEMORY:
+                self._forget_locked(next(iter(self._judged)))
 
-    def peek(self, call_id: str | None) -> Verdict | None:
+    def _forget_locked(self, key: tuple[str, str]) -> None:
+        entry = self._judged.pop(key, None)
+        for digest in entry or ():
+            if self._by_input.get((key[0], digest)) == key:
+                del self._by_input[(key[0], digest)]
+
+    def peek(self, tool_name: str, call_id: str | None) -> Verdict | None:
+        """The verdict standing for a call, a deny winning over an allow; ``None`` when unjudged."""
         if not call_id:
             return None
         with self._lock:
-            return self._verdicts.get(call_id)
+            entry = self._judged.get((tool_name, call_id))
+            if not entry:
+                return None
+            for verdict in entry.values():
+                if not verdict.allowed:
+                    return verdict
+            return next(iter(entry.values()))
 
-    def take(self, call_id: str | None) -> Verdict | None:
-        if not call_id:
+    def peek_input(
+        self, tool_name: str, call_id: str | None, tool_input: Mapping[str, Any]
+    ) -> Verdict | None:
+        """The verdict made for exactly this call and input, left in place."""
+        digest = input_digest(tool_input)
+        if not call_id or digest is None:
             return None
         with self._lock:
-            return self._verdicts.pop(call_id, None)
+            entry = self._judged.get((tool_name, call_id))
+            return entry.get(digest) if entry else None
+
+    def take(self, tool_name: str, call_id: str | None, tool_input: Mapping[str, Any]) -> Recalled:
+        """Consume the verdict made for exactly this call and input.
+
+        A call judged for other bytes is reported as such and forgotten
+        entirely: nothing under that id runs without a fresh decision.
+        """
+        if not call_id:
+            return Recalled()
+        digest = input_digest(tool_input)
+        key = (tool_name, call_id)
+        with self._lock:
+            entry = self._judged.get(key)
+            if entry is None:
+                return Recalled()
+            verdict = entry.get(digest) if digest is not None else None
+            if verdict is None or digest is None:
+                self._forget_locked(key)
+                return Recalled(other_input=True)
+            del entry[digest]
+            if self._by_input.get((tool_name, digest)) == key:
+                del self._by_input[(tool_name, digest)]
+            if not entry:
+                del self._judged[key]
+            return Recalled(verdict=verdict)
+
+    def take_input(self, tool_name: str, tool_input: Mapping[str, Any]) -> Verdict | None:
+        """Consume the verdict made for this input on a channel that carries no call id."""
+        digest = input_digest(tool_input)
+        if digest is None:
+            return None
+        with self._lock:
+            key = self._by_input.pop((tool_name, digest), None)
+            if key is None:
+                return None
+            entry = self._judged.get(key)
+            verdict = entry.pop(digest, None) if entry else None
+            if entry is not None and not entry:
+                del self._judged[key]
+            return verdict
+
+    def reject_uncorrelated(self, tool_name: str, call_id: str | None) -> str:
+        """The reason an approval item the adapter cannot tie to a decision is rejected with.
+
+        Counted and logged (tool name and call id only): the edge never saw
+        this call, so the adapter's log is the only record of the refusal.
+        """
+        self._bump("uncorrelated")
+        self._logger.warning(
+            "MITRITY: rejected an approval for %s (call %s) it could not correlate to a decision",
+            tool_name,
+            call_id or "unknown",
+        )
+        return _UNCORRELATED_REASON.format(tool=tool_name, call_id=call_id or "unknown")
+
+    def mismatch(self, tool_name: str, call_id: str | None) -> MitrityDenied:
+        """The refusal for an execution whose input is not the one the edge judged."""
+        self._bump("mismatched")
+        self._logger.warning(
+            "MITRITY: blocked %s (call %s): its input is not the input the edge judged",
+            tool_name,
+            call_id or "unknown",
+        )
+        return MitrityDenied(_MISMATCH_REASON.format(tool=tool_name, call_id=call_id or "unknown"))
+
+    def _bump(self, counter: str) -> None:
+        with self._lock:
+            setattr(self.stats, counter, getattr(self.stats, counter) + 1)
 
     # ------------------------------------------------------------- attestation
 
@@ -283,7 +455,7 @@ class OpenAIAgentsGovernor:
             return
         with self._lock:
             self._attested[session_id] = digest
-        self.stats.attestations += 1
+        self._bump("attestations")
 
     # --------------------------------------------------------------- requests
 
@@ -322,31 +494,32 @@ class OpenAIAgentsGovernor:
             )
             verdict = await self._client.decide_async(request)
         except Exception as exc:
-            self.stats.unreachable += 1
+            self._bump("unreachable")
             self._logger.error(
                 "MITRITY: admission of %s failed inside the adapter: %r", tool_name, exc
             )
             return Verdict(
                 allowed=False,
                 reason=(
-                    f"MITRITY could not authorize {tool_name} and blocked it: {exc!r}. "
+                    f"MITRITY could not authorize {tool_name} and blocked it: "
+                    f"{_bound(repr(exc))}. "
                     "This is not a policy decision — the adapter failed before the edge answered."
                 ),
                 error=AdmissionError(str(exc)),
             )
-        self.stats.admitted += 1
+        self._bump("admitted")
         if verdict.allowed:
-            self.stats.allowed += 1
+            self._bump("allowed")
             if verdict.updated_input is not None:
-                self.stats.routed += 1
+                self._bump("routed")
                 if verdict.routed_to:
                     self._logger.info("MITRITY routed %s to %s", tool_name, verdict.routed_to)
         elif verdict.unreachable:
-            self.stats.unreachable += 1
+            self._bump("unreachable")
         elif verdict.held:
-            self.stats.held += 1
+            self._bump("held")
         else:
-            self.stats.denied += 1
+            self._bump("denied")
         return verdict
 
 
@@ -395,14 +568,14 @@ def _govern_function_tool(tool: FunctionTool, governor: OpenAIAgentsGovernor) ->
 
     async def guardrail_function(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
         ctx = data.context
+        tool_input = _parse_arguments(ctx.tool_arguments)
         verdict = await governor.admit(
-            tool_name=tool.name,
-            tool_input=_parse_arguments(ctx.tool_arguments),
-            ctx=ctx,
-            call_id=ctx.tool_call_id,
+            tool_name=tool.name, tool_input=tool_input, ctx=ctx, call_id=ctx.tool_call_id
         )
+        # Remembered whatever it says: the invoker reuses an allow for the same
+        # bytes, and a deny replaces any allow an earlier call under this id left.
+        governor.remember(tool.name, ctx.tool_call_id, tool_input, verdict)
         if verdict.allowed:
-            governor.remember(ctx.tool_call_id, verdict)
             return ToolGuardrailFunctionOutput.allow()
         return ToolGuardrailFunctionOutput.reject_content(verdict.reason)
 
@@ -411,18 +584,19 @@ def _govern_function_tool(tool: FunctionTool, governor: OpenAIAgentsGovernor) ->
     )
 
     async def on_invoke_tool(ctx: ToolContext[Any], input_json: str) -> Any:
-        verdict = governor.take(ctx.tool_call_id)
+        tool_input = _parse_arguments(input_json)
+        recalled = governor.take(tool.name, ctx.tool_call_id, tool_input)
+        if recalled.other_input:
+            raise governor.mismatch(tool.name, ctx.tool_call_id)
+        verdict = recalled.verdict
         if verdict is None:
             # The guardrail did not run for this call: admit here. A deny has
             # no gentler channel than ending the run — and the call must not run.
             verdict = await governor.admit(
-                tool_name=tool.name,
-                tool_input=_parse_arguments(input_json),
-                ctx=ctx,
-                call_id=ctx.tool_call_id,
+                tool_name=tool.name, tool_input=tool_input, ctx=ctx, call_id=ctx.tool_call_id
             )
-            if not verdict.allowed:
-                raise MitrityDenied(verdict.reason)
+        if not verdict.allowed:
+            raise MitrityDenied(verdict.reason)
         if verdict.updated_input is not None:
             input_json = _merge_arguments(tool.name, input_json, verdict)
         return await original_invoke(ctx, input_json)
@@ -455,12 +629,43 @@ async def _developer_needs_approval(setting: Any, *args: Any) -> bool:
 
 
 def _approval_call_id(item: ToolApprovalItem) -> str | None:
+    """The ``call_id`` of the call an approval item stands for.
+
+    Read the way the SDK reads it for shell and apply_patch calls — the
+    ``call_id`` of the raw item, mapping or object — and nothing else: the
+    item ``id`` is not a call id, and guessing one would correlate the
+    approval to a decision made about another call.
+    """
     raw = item.raw_item
-    if isinstance(raw, Mapping):
-        value = raw.get("call_id") or raw.get("id")
-    else:
-        value = getattr(raw, "call_id", None) or getattr(raw, "id", None)
+    value = raw.get("call_id") if isinstance(raw, Mapping) else getattr(raw, "call_id", None)
     return value if isinstance(value, str) and value else None
+
+
+async def _approval_decision(
+    tool_name: str,
+    governor: OpenAIAgentsGovernor,
+    inner_on_approval: Any,
+    ctx: RunContextWrapper[Any],
+    item: ToolApprovalItem,
+) -> Any:
+    """The adapter's ``on_approval``: reject what MITRITY denied or cannot place, else defer.
+
+    An approval item the adapter cannot correlate to a decision — no call id
+    on the item, or a call nothing judged — is rejected, never left to the
+    developer's handler or to the pending interrupt: an auto-approving host
+    would otherwise run a call the edge never saw.
+    """
+    call_id = _approval_call_id(item)
+    verdict = governor.peek(tool_name, call_id)
+    if verdict is None:
+        return {"approve": False, "reason": governor.reject_uncorrelated(tool_name, call_id)}
+    if not verdict.allowed:
+        return {"approve": False, "reason": verdict.reason}
+    if inner_on_approval is not None:
+        return await _maybe_await(inner_on_approval(ctx, item))
+    # MITRITY allowed and the developer asked for approval without a
+    # handler: no decision here, their pending-approval interrupt stands.
+    return {}
 
 
 def _fields(obj: Any) -> dict[str, Any]:
@@ -491,10 +696,16 @@ def _govern_shell_tool(tool: ShellTool, governor: OpenAIAgentsGovernor) -> Shell
     async def needs_approval(
         ctx: RunContextWrapper[Any], action: ShellActionRequest, call_id: str
     ) -> bool:
-        verdict = await governor.admit(
-            tool_name=tool.name, tool_input=_fields(action), ctx=ctx, call_id=call_id
-        )
-        governor.remember(call_id, verdict)
+        tool_input = _fields(action)
+        # The SDK evaluates needs_approval more than once for one call on a
+        # resumed turn; the same call and the same bytes get the decision
+        # already made for them, not a second admission.
+        verdict = governor.peek_input(tool.name, call_id, tool_input)
+        if verdict is None:
+            verdict = await governor.admit(
+                tool_name=tool.name, tool_input=tool_input, ctx=ctx, call_id=call_id
+            )
+            governor.remember(tool.name, call_id, tool_input, verdict)
         if not verdict.allowed:
             # MITRITY objects: the SDK's approval step is where a rejection
             # with a reason reaches the model, and on_approval below rejects.
@@ -504,24 +715,24 @@ def _govern_shell_tool(tool: ShellTool, governor: OpenAIAgentsGovernor) -> Shell
     async def on_approval(
         ctx: RunContextWrapper[Any], item: ToolApprovalItem
     ) -> ShellOnApprovalFunctionResult:
-        verdict = governor.peek(_approval_call_id(item))
-        if verdict is not None and not verdict.allowed:
-            return {"approve": False, "reason": verdict.reason}
-        if inner_on_approval is not None:
-            return cast(
-                ShellOnApprovalFunctionResult, await _maybe_await(inner_on_approval(ctx, item))
-            )
-        # MITRITY allowed and the developer asked for approval without a
-        # handler: no decision here, their pending-approval interrupt stands.
-        return cast(ShellOnApprovalFunctionResult, {})
+        return cast(
+            ShellOnApprovalFunctionResult,
+            await _approval_decision(tool.name, governor, inner_on_approval, ctx, item),
+        )
 
     async def executor(request: ShellCommandRequest) -> str | ShellResult:
         call_id = request.data.call_id
-        verdict = governor.take(call_id)
+        tool_input = _fields(request.data.action)
+        recalled = governor.take(tool.name, call_id, tool_input)
+        if recalled.other_input:
+            raise governor.mismatch(tool.name, call_id)
+        verdict = recalled.verdict
         if verdict is None:
+            # Nothing judged this call — an approved call on a resumed run
+            # skips needs_approval — so the executor is the gate.
             verdict = await governor.admit(
                 tool_name=tool.name,
-                tool_input=_fields(request.data.action),
+                tool_input=tool_input,
                 ctx=request.ctx_wrapper,
                 call_id=call_id,
             )
@@ -555,6 +766,85 @@ def _rewrite_shell_request(
     return dataclasses.replace(request, data=data)
 
 
+def _refuse_apply_patch_rewrite(tool_name: str, verdict: Verdict) -> Verdict:
+    """An allow that rewrites an apply_patch operation is a deny.
+
+    No editor channel can apply a rewrite: the editor receives the operation
+    alone, and the original bytes must not run under a decision made about
+    different ones.
+    """
+    if not verdict.allowed or verdict.updated_input is None:
+        return verdict
+    return Verdict(
+        allowed=False,
+        reason=(
+            f"MITRITY rewrote the input of {tool_name} "
+            f"(keys {sorted(verdict.updated_input)!r}), which the adapter cannot apply "
+            "to an apply_patch operation; the call was blocked rather than run unchanged"
+        ),
+        decision=verdict.decision,
+        updated_input=verdict.updated_input,
+        routed_to=verdict.routed_to,
+    )
+
+
+class _GovernedEditor:
+    """An ``ApplyPatchEditor`` that admits every operation before the developer's editor runs it.
+
+    The SDK calls the editor with the operation alone — no call id — so the
+    decision ``needs_approval`` made is found by the operation's digest. An
+    operation nothing judged (an approved call on a resumed run skips
+    ``needs_approval``) is admitted here. A deny, a rewrite and an editor
+    that cannot perform the operation each raise ``MitrityDenied``: the SDK
+    reports the failure to the model, and nothing is applied.
+    """
+
+    def __init__(self, inner: Any, tool_name: str, governor: OpenAIAgentsGovernor) -> None:
+        self._inner = inner
+        self._tool_name = tool_name
+        self._governor = governor
+
+    @property
+    def inner(self) -> Any:
+        return self._inner
+
+    def can_perform(self, method: str) -> bool:
+        return callable(getattr(self._inner, method, None))
+
+    async def create_file(self, operation: ApplyPatchOperation) -> Any:
+        return await self._apply("create_file", operation)
+
+    async def update_file(self, operation: ApplyPatchOperation) -> Any:
+        return await self._apply("update_file", operation)
+
+    async def delete_file(self, operation: ApplyPatchOperation) -> Any:
+        return await self._apply("delete_file", operation)
+
+    async def _apply(self, method: str, operation: ApplyPatchOperation) -> Any:
+        tool_input = _fields(operation)
+        verdict = self._governor.take_input(self._tool_name, tool_input)
+        if verdict is None:
+            verdict = await self._governor.admit(
+                tool_name=self._tool_name,
+                tool_input=tool_input,
+                ctx=operation.ctx_wrapper,
+                call_id=None,
+            )
+            verdict = _refuse_apply_patch_rewrite(self._tool_name, verdict)
+        if not verdict.allowed:
+            raise MitrityDenied(verdict.reason)
+        if not self.can_perform(method):
+            raise MitrityDenied(
+                f"MITRITY blocked {self._tool_name}: the tool has no editor able to "
+                f"{method.replace('_', ' ')}, so nothing was applied. "
+                "This is not a policy decision."
+            )
+        return await _maybe_await(getattr(self._inner, method)(operation))
+
+
+_EDITOR_METHODS = ("create_file", "update_file", "delete_file")
+
+
 def _govern_apply_patch_tool(
     tool: ApplyPatchTool, governor: OpenAIAgentsGovernor
 ) -> ApplyPatchTool:
@@ -564,29 +854,26 @@ def _govern_apply_patch_tool(
     governor.register_hooked(tool.name)
     inner_needs = tool.needs_approval
     inner_on_approval = tool.on_approval
+    editor = _GovernedEditor(tool.editor, tool.name, governor)
+    missing = [method for method in _EDITOR_METHODS if not editor.can_perform(method)]
+    if missing:
+        governor.logger.warning(
+            "MITRITY: %s has no editor able to %s; those operations will be blocked",
+            tool.name,
+            ", ".join(method.replace("_", " ") for method in missing),
+        )
 
     async def needs_approval(
         ctx: RunContextWrapper[Any], operation: ApplyPatchOperation, call_id: str
     ) -> bool:
-        verdict = await governor.admit(
-            tool_name=tool.name, tool_input=_fields(operation), ctx=ctx, call_id=call_id
-        )
-        if verdict.allowed and verdict.updated_input is not None:
-            # The editor receives the operation without a call id to correlate
-            # a rewrite to; the original bytes must not run under a decision
-            # made about different ones.
-            verdict = Verdict(
-                allowed=False,
-                reason=(
-                    f"MITRITY rewrote the input of {tool.name} "
-                    f"(keys {sorted(verdict.updated_input)!r}), which the adapter cannot apply "
-                    "to an apply_patch operation; the call was blocked rather than run unchanged"
-                ),
-                decision=verdict.decision,
-                updated_input=verdict.updated_input,
-                routed_to=verdict.routed_to,
+        tool_input = _fields(operation)
+        verdict = governor.peek_input(tool.name, call_id, tool_input)
+        if verdict is None:
+            verdict = await governor.admit(
+                tool_name=tool.name, tool_input=tool_input, ctx=ctx, call_id=call_id
             )
-        governor.remember(call_id, verdict)
+            verdict = _refuse_apply_patch_rewrite(tool.name, verdict)
+            governor.remember(tool.name, call_id, tool_input, verdict)
         if not verdict.allowed:
             return True
         return await _developer_needs_approval(inner_needs, ctx, operation, call_id)
@@ -594,18 +881,53 @@ def _govern_apply_patch_tool(
     async def on_approval(
         ctx: RunContextWrapper[Any], item: ToolApprovalItem
     ) -> ApplyPatchOnApprovalFunctionResult:
-        verdict = governor.peek(_approval_call_id(item))
-        if verdict is not None and not verdict.allowed:
-            return {"approve": False, "reason": verdict.reason}
-        if inner_on_approval is not None:
-            return cast(
-                ApplyPatchOnApprovalFunctionResult,
-                await _maybe_await(inner_on_approval(ctx, item)),
-            )
-        return cast(ApplyPatchOnApprovalFunctionResult, {})
+        return cast(
+            ApplyPatchOnApprovalFunctionResult,
+            await _approval_decision(tool.name, governor, inner_on_approval, ctx, item),
+        )
 
     setattr(needs_approval, _GOVERNED_MARKER, True)
-    return dataclasses.replace(tool, needs_approval=needs_approval, on_approval=on_approval)
+    return dataclasses.replace(
+        tool, needs_approval=needs_approval, on_approval=on_approval, editor=editor
+    )
+
+
+def _rewrite_local_shell_request(
+    tool_name: str, request: LocalShellCommandRequest, updated: Mapping[str, Any]
+) -> LocalShellCommandRequest | str:
+    """The request with ``updated`` applied to its action, or the reason the rewrite was refused.
+
+    The action is one of the API's pydantic models; a rewrite is applied only
+    when its fields can be enumerated and every rewritten key is one of them.
+    Anything less — an action the adapter cannot introspect or copy, a key
+    the action has no place for — refuses the rewrite and blocks the call:
+    the original command must not run under a decision made about the
+    rewritten one.
+    """
+    data = request.data
+    action = data.action
+    known = set(getattr(type(action), "model_fields", None) or ())
+    if not known:
+        return (
+            f"MITRITY rewrote the input of {tool_name} (keys {sorted(updated)!r}) but the "
+            "adapter cannot introspect the action to apply it; the call was blocked rather "
+            "than run unchanged"
+        )
+    unknown = sorted(set(updated) - known)
+    if unknown:
+        return (
+            f"MITRITY rewrote the input of {tool_name} with keys the action has no place "
+            f"for ({unknown!r}); the call was blocked rather than run unchanged"
+        )
+    try:
+        new_action = action.model_copy(update=dict(updated))
+        new_data = data.model_copy(update={"action": new_action})
+    except Exception as exc:
+        return (
+            f"MITRITY rewrote the input of {tool_name} but the adapter could not apply it "
+            f"({_bound(repr(exc))}); the call was blocked rather than run unchanged"
+        )
+    return LocalShellCommandRequest(ctx_wrapper=request.ctx_wrapper, data=new_data)
 
 
 def _govern_local_shell_tool(
@@ -619,11 +941,10 @@ def _govern_local_shell_tool(
 
     async def executor(request: LocalShellCommandRequest) -> str:
         data = request.data
-        action = data.action
         call_id = getattr(data, "call_id", None)
         verdict = await governor.admit(
             tool_name=tool.name,
-            tool_input=_fields(action),
+            tool_input=_fields(data.action),
             ctx=request.ctx_wrapper,
             call_id=call_id if isinstance(call_id, str) else None,
         )
@@ -632,18 +953,10 @@ def _govern_local_shell_tool(
             # deprecated tool; the executor's output is the only channel.
             return f"MITRITY denied this command and nothing was executed: {verdict.reason}"
         if verdict.updated_input is not None:
-            updated = dict(verdict.updated_input)
-            known = set(getattr(type(action), "model_fields", {}))
-            unknown = sorted(set(updated) - known) if known else []
-            if unknown:
-                return (
-                    f"MITRITY rewrote the input of {tool.name} with keys the action has no place "
-                    f"for ({unknown!r}); the call was blocked rather than run unchanged"
-                )
-            new_action = action.model_copy(update=updated)
-            request = LocalShellCommandRequest(
-                ctx_wrapper=request.ctx_wrapper, data=data.model_copy(update={"action": new_action})
-            )
+            rewritten = _rewrite_local_shell_request(tool.name, request, verdict.updated_input)
+            if isinstance(rewritten, str):
+                return rewritten
+            request = rewritten
         return cast(str, await _maybe_await(inner_executor(request)))
 
     setattr(executor, _GOVERNED_MARKER, True)
@@ -686,10 +999,18 @@ def govern_tools(
         elif isinstance(tool, LocalShellTool):
             out.append(_govern_local_shell_tool(tool, shared))
         else:
+            name = _tool_name(tool)
             if isinstance(tool, HostedMCPTool):
                 label = tool.tool_config.get("server_label") or "unknown"
                 shared.register_mcp_server(f"hosted:{label}")
-            shared.register_unhooked(_tool_name(tool))
+            if not isinstance(tool, HOSTED_TOOL_TYPES):
+                shared.logger.warning(
+                    "MITRITY: %s (%s) is a tool type this adapter does not know; it passes "
+                    "through ungoverned and is attested as unhooked",
+                    name,
+                    type(tool).__name__,
+                )
+            shared.register_unhooked(name)
             out.append(tool)
     return out
 
@@ -766,6 +1087,8 @@ __all__ = [
     "GovernorStats",
     "MitrityDenied",
     "OpenAIAgentsGovernor",
+    "Recalled",
     "govern",
     "govern_tools",
+    "input_digest",
 ]
