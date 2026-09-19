@@ -987,3 +987,15 @@ def test_unknown_tool_types_pass_through_as_unhooked_with_a_warning(
     assert governor.unhooked_tools == ("mystery", "web_search")
     assert "mystery" in caplog.text and "web_search" not in caplog.text
     assert WebSearchTool in HOSTED_TOOL_TYPES
+
+
+def test_a_hosted_environment_shell_tool_passes_through_as_unhooked(
+    client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    hosted = ShellTool(environment={"type": "container_auto"})
+    governor = OpenAIAgentsGovernor(client=client)
+    with caplog.at_level(logging.WARNING, logger="mitrity.openai_agents"):
+        tool = only(govern_tools([hosted], governor=governor), ShellTool)
+    assert tool is hosted and tool.executor is None and tool.on_approval is None
+    assert governor.unhooked_tools == ("shell",) and governor.hooked_tools == ()
+    assert "hosted container_auto environment" in caplog.text

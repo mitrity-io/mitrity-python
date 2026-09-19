@@ -21,8 +21,9 @@ Each tool type is refused the way the SDK itself refuses that type
   is what the developer's executor receives;
 - ``LocalShellTool`` (deprecated upstream) has neither guardrails nor
   approvals, so its executor is wrapped and a deny is its output;
-- hosted tools and ``ComputerTool`` pass through untouched and are attested
-  as unhooked, so the coverage posture says what is not governed.
+- hosted tools, ``ComputerTool`` and a ``ShellTool`` whose ``environment`` is
+  a hosted container pass through untouched and are attested as unhooked,
+  so the coverage posture says what is not governed.
 
 Judged bytes are the executed bytes. A decision is remembered together with
 a digest of the input it was made for, keyed by the tool and the SDK's call
@@ -684,9 +685,29 @@ def _fields(obj: Any) -> dict[str, Any]:
     return out
 
 
+def _shell_environment_type(tool: ShellTool) -> str:
+    """Where the SDK runs this shell tool's commands: ``local``, or a hosted container type."""
+    environment = tool.environment
+    kind = environment.get("type") if environment else None
+    return kind if isinstance(kind, str) and kind else "local"
+
+
 def _govern_shell_tool(tool: ShellTool, governor: OpenAIAgentsGovernor) -> ShellTool:
     if getattr(tool.needs_approval, _GOVERNED_MARKER, False):
         governor.register_hooked(tool.name)
+        return tool
+    environment = _shell_environment_type(tool)
+    if environment != "local":
+        # The commands run in OpenAI's container: no executor, no approval
+        # flow, nothing in-process the adapter can judge. Like the hosted
+        # tools it passes through, and the attestation names the gap.
+        governor.logger.warning(
+            "MITRITY: %s runs in a hosted %s environment the adapter cannot judge; it passes "
+            "through ungoverned and is attested as unhooked",
+            tool.name,
+            environment,
+        )
+        governor.register_unhooked(tool.name)
         return tool
     governor.register_hooked(tool.name)
     inner_needs = tool.needs_approval
