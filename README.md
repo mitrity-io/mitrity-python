@@ -1,7 +1,8 @@
 # mitrity
 
-MITRITY governance adapter for Python agents: Claude Agent SDK and LangChain
-integrations for the MITRITY edge (admission API and gateway).
+MITRITY governance adapter for Python agents: Claude Agent SDK, LangChain,
+OpenAI Agents SDK and CrewAI integrations for the MITRITY edge (admission API
+and gateway).
 
 The MITRITY gateway governs what an agent asks it to do over MCP. It cannot
 see what the agent's *framework* does on its own — the Agent SDK's `Bash`,
@@ -22,10 +23,13 @@ once one exists, a commit SHA until then):
 ```bash
 pip install "mitrity[claude-agent-sdk] @ git+https://github.com/mitrity-io/mitrity-python.git@<ref>"
 pip install "mitrity[langchain] @ git+https://github.com/mitrity-io/mitrity-python.git@<ref>"
+pip install "mitrity[openai-agents] @ git+https://github.com/mitrity-io/mitrity-python.git@<ref>"
+pip install "mitrity[crewai] @ git+https://github.com/mitrity-io/mitrity-python.git@<ref>"
 ```
 
 Python ≥ 3.10. The only runtime dependency is `httpx`; the framework extras
-pull in `claude-agent-sdk` and `langchain-core` respectively.
+pull in `claude-agent-sdk`, `langchain-core`, `openai-agents` and `crewai`
+respectively.
 
 ## Prerequisite: a co-located edge
 
@@ -147,6 +151,99 @@ Two honest limits:
 The session id is, in order: the `session_id` you pass, the
 `configurable.thread_id` of the run config, or one id per process.
 
+## OpenAI Agents SDK
+
+```python
+from agents import Agent, Runner, ShellTool, function_tool
+from mitrity.openai_agents import govern
+
+
+@function_tool
+def run_command(command: str) -> str:
+    """Run a shell command on the build host and return its output."""
+    ...
+
+
+agent = govern(Agent(name="ops", tools=[run_command, ShellTool(executor=my_executor)]))
+result = await Runner.run(agent, "clean up the build directory")
+```
+
+`govern(agent)` returns a clone of the agent whose tools ask the edge before
+they run; `govern_tools(tools)` does the same for a list. Each tool type is
+blocked the way the SDK itself blocks that type:
+
+- A **function tool** gets a *tool input guardrail*: a deny is
+  `reject_content` with the policy reason, which the SDK hands to the model
+  as the tool's output without running the tool. An allow is silent. An
+  `updated_input` from the edge is merged into the JSON arguments the
+  function receives.
+- **`ShellTool`** and **`ApplyPatchTool`** go through the SDK's approval
+  flow: the adapter's `needs_approval` asks the edge, and on a deny its
+  `on_approval` rejects the call with the reason — as it rejects an approval
+  it cannot tie to a decision it made. Your own `needs_approval` and
+  `on_approval` still apply when MITRITY allows. The execution channel is
+  gated as well: the wrapped shell executor and the wrapped `apply_patch`
+  editor re-check the decision `needs_approval` made, and admit a call the
+  SDK runs without asking (an approved call on a resumed run); a deny there
+  reaches the model as the tool's failed output. The shell executor runs the
+  edge's rewritten `commands` when it sends them; an `apply_patch` rewrite
+  is a deny (the editor receives the operation alone, with nothing to apply
+  a rewrite to). A `ShellTool` whose `environment` is a hosted container
+  runs in OpenAI's cloud and passes through like the hosted tools below.
+- **`LocalShellTool`** (deprecated upstream) has neither a guardrail nor an
+  approval, so a deny is returned as the executor's output with nothing run.
+- **Hosted tools** (web search, file search, code interpreter, image
+  generation, hosted MCP) run in OpenAI's cloud and `ComputerTool` drives a
+  computer the SDK does not judge: they pass through untouched and are
+  reported as ungoverned in the attestation.
+
+Judged bytes are the executed bytes. A decision is kept for the tool, the
+SDK's `call_id` and a digest of the input it was made for; the invoker,
+executor or editor reuses it only for that exact input, and an execution
+whose input differs from what the edge judged raises `MitrityDenied` rather
+than running under that decision.
+
+MCP servers on the agent are not touched. Pass the MITRITY gateway server as
+`gateway=` so it is not reported as ungoverned; every other server is. The
+session id is, in order: the `session_id` you pass, `RunConfig.group_id`, or
+one id per process. Handoff targets given as `Agent` objects are governed
+too, once each — a specialist handing back to the triage agent, or two paths
+to the same agent, resolve to one governed clone; a `Handoff` object built
+with `handoff()` is left as is, so govern its agent before building it. A
+tool type the adapter does not know passes through with a warning and is
+reported as ungoverned.
+
+## CrewAI
+
+```python
+from crewai import Agent
+from mitrity.crewai import govern_tools
+
+agent = Agent(role="ops", goal="...", backstory="...", tools=govern_tools([terminal, writer]))
+```
+
+`govern(tool)` returns a `BaseTool` with the same name, description and
+schema whose `_run` / `_arun` admit the call first. A deny is returned as a
+`ToolFailure` carrying the policy reason — CrewAI's declared channel for a
+tool that did not do what it was asked: the agent sees the reason, the
+failure is recorded on the task output, and the agent's `tool_failure_policy`
+decides whether to continue or abort. An `updated_input` from the edge
+replaces the arguments before the wrapped tool runs; a rewrite of several
+positional arguments must cover every one of them or the call is blocked.
+
+A governed tool never caches: CrewAI's tool cache would replay an earlier
+result for the same arguments without the edge judging the call again, so
+the inner tool's `cache_function` is not copied and the governed one always
+answers no. Govern a tool before its first run — the crew reads its cache by
+tool name before the tool is reached, so a result an ungoverned run of the
+same tool cached earlier would still be served.
+
+Coverage is what you hand it. Tools CrewAI adds to an agent on its own — the
+delegation tools, the code interpreter behind `allow_code_execution=True`,
+MCP tools from `mcps` — never pass through `govern` and are invisible to the
+adapter; on Linux hosts the MITRITY observer reports their executions after
+the fact.
+
 ## The wire client
 
 Both integrations sit on `mitrity.admission.Client`, which you can use for
@@ -171,8 +268,10 @@ Async variants: `decide_async`, `admit_async`, `attest_async`.
 
 ## What is not governed
 
-- Tools outside the hook matcher, or LangChain tools not passed to `govern`.
-  The attestation names them; the MITRITY dashboard shows the gap.
+- Tools outside the hook matcher, or LangChain / CrewAI tools not passed to
+  `govern`. The attestation names them; the MITRITY dashboard shows the gap.
+- Hosted tools of the OpenAI Agents SDK (they run in the vendor's cloud) and
+  its `ComputerTool`; reported as ungoverned in the attestation.
 - The agent's own code: `subprocess.run` in your application never passes a
   tool boundary. On Linux hosts the MITRITY observer reports it after the
   fact.
@@ -190,7 +289,7 @@ ruff check . && ruff format --check . && mypy --strict && pytest
 
 Tests run against an in-process fake edge over a Unix socket; no MITRITY
 account and no network are needed. The conformance tests are numbered after
-the contract (`C1`–`C20`).
+the contract (`C1`–`C28`).
 
 ## Security
 

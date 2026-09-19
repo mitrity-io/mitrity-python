@@ -5,13 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "mitrity"
 dynamic = ["version"]
-description = "MITRITY governance adapter for Python agents: Claude Agent SDK and LangChain integrations for the MITRITY edge (admission API and gateway)."
+description = "MITRITY governance adapter for Python agents: Claude Agent SDK, LangChain, OpenAI Agents SDK and CrewAI integrations for the MITRITY edge (admission API and gateway)."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "MITRITY AB", email = "hello@mitrity.com" }]
-keywords = ["mitrity", "governance", "agents", "claude-agent-sdk", "langchain", "mcp"]
+keywords = ["mitrity", "governance", "agents", "claude-agent-sdk", "langchain", "openai-agents", "crewai", "mcp"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -28,10 +28,14 @@ dependencies = ["httpx>=0.27,<1"]
 [project.optional-dependencies]
 claude-agent-sdk = ["claude-agent-sdk>=0.2.157"]
 langchain = ["langchain-core>=1.0"]
+openai-agents = ["openai-agents>=0.20"]
+crewai = ["crewai>=1.15"]
 dev = [
   "anyio>=4.4",
   "claude-agent-sdk>=0.2.157",
+  "crewai>=1.15",
   "langchain-core>=1.0",
+  "openai-agents>=0.20",
   "mypy>=1.14",
   "pytest>=8.4",
   "ruff>=0.8",
@@ -80,14 +84,19 @@ ignore = [
 known-first-party = ["mitrity"]
 
 [tool.mypy]
-python_version = "3.10"
+# 3.12, not the 3.10 floor: crewai's dependency chain reaches numpy, whose inline
+# stubs use PEP 695 `type` statements that mypy refuses under an older target, and
+# mypy 2.x parses an installed package's own stubs regardless of follow_imports.
+# The 3.10 floor is still enforced by ruff (target-version py310) and by the CI
+# test job that imports every module on 3.10.
+python_version = "3.12"
 strict = true
 warn_unreachable = true
 show_error_codes = true
 files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["claude_agent_sdk.*", "langchain_core.*"]
+module = ["claude_agent_sdk.*", "langchain_core.*", "agents.*", "crewai.*", "openai.*"]
 follow_untyped_imports = true
 
 [tool.pytest.ini_options]

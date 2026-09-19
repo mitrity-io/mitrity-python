@@ -9,10 +9,12 @@ honest coverage badge.
 - :mod:`mitrity.admission` — the wire client (no framework dependency).
 - :mod:`mitrity.claude_agent_sdk` — ``governed_options()`` for the Claude Agent SDK.
 - :mod:`mitrity.langchain` — ``govern()`` / ``govern_tools()`` for LangChain tools.
+- :mod:`mitrity.openai_agents` — ``govern()`` / ``govern_tools()`` for the OpenAI Agents SDK.
+- :mod:`mitrity.crewai` — ``govern()`` / ``govern_tools()`` for CrewAI tools.
 
 Contract: https://github.com/mitrity-io/iag-specs/blob/main/sentinel/adapters.md
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["__version__"]
