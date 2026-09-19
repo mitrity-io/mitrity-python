@@ -74,6 +74,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["PLR0915", "PLC0415", "S104", "SIM117"]
+".github/scripts/**" = ["T20"] # release_check.py reports to the console on purpose
 
 [tool.ruff.lint.isort]
 known-first-party = ["mitrity"]
