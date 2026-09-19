@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv*/
+venv/
+
+# Tooling
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Agent worktrees
+.claude/worktrees/
+
+# Files the review workflows write into a checkout when run locally
+/diff.txt
+/diff_truncated.txt
+/diff_nolock.txt
+/review.md
+/verdict.txt
+/comment.md
+/comment_truncated.md
+/untrusted_input.md
+/pr.json
