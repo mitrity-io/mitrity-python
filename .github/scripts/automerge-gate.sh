@@ -101,6 +101,10 @@ merge_now() {
     [ -n "$REQUIRED_CTX" ] || { say "::warning::Not merged: branch protection on $BASE_REF names no required status check"; return 0; }
     ROLLUP_JSON=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '.statusCheckRollup' 2>/dev/null) || { say "::warning::Not merged: could not read the checks"; return 0; }
     MISSING=""
+    # SKIPPED and NEUTRAL count as green on purpose: that is GitHub's own reading
+    # of a required context whose job-level `if:` was false (a review workflow
+    # that skips Dependabot PRs); the review-identity check above, not this
+    # loop, is what requires the agents' approvals.
     while IFS= read -r CTX; do
       [ -n "$CTX" ] || continue
       OK=$(printf '%s' "$ROLLUP_JSON" | jq -r --arg c "$CTX" '[.[] | select((.name // .context) == $c) | (.conclusion // .state // "")] | if length == 0 then "absent" elif all(. == "SUCCESS" or . == "SKIPPED" or . == "NEUTRAL") then "ok" else join(",") end')
@@ -145,6 +149,10 @@ if [ "$N_FILES" -gt 3000 ]; then disarm "PR changes $N_FILES files, more than th
 # Both names of a renamed file count: moving a workflow out of .github/ is a
 # change to the workflow surface, and the new name alone would not show it.
 CHANGED=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' 2>/dev/null) || { disarm "could not list the PR files"; exit 0; }
+# An empty list is a refusal too: a PR always changes at least one file, so an
+# empty answer is a partial or failed listing, and everything below (the
+# surface check, the security path filter) would otherwise read it as "nothing".
+[ -n "$(printf '%s' "$CHANGED" | tr -d '[:space:]')" ] || { disarm "the PR file list came back empty"; exit 0; }
 SURFACE_RE='^\.github/|(^|/)CLAUDE\.md$|(^|/)AGENTS\.md$|(^|/)\.claude/|^\.mcp\.json$|^action\.ya?ml$'
 WF_CHANGE=$(printf '%s\n' "$CHANGED" | grep -m1 -E "$SURFACE_RE" || true)
 if [ -n "$WF_CHANGE" ]; then
@@ -178,7 +186,7 @@ if [ "$DEPENDABOT" = "1" ]; then
   TIER=unknown
   # Same rule as dependency-review.yml's classifier: a full X.Y.Z on both sides,
   # anything else is unknown and merged by hand.
-  if printf '%s' "$TITLE" | grep -qE '[Bb]ump [^ ]+( [^ ]+)* from [0-9]+\.[0-9]+\.[0-9]+ to [0-9]+\.[0-9]+\.[0-9]+$'; then
+  if printf '%s' "$TITLE" | grep -qE '(^|: )[Bb]ump [^ ]+ from [0-9]+\.[0-9]+\.[0-9]+ to [0-9]+\.[0-9]+\.[0-9]+( in [^ ]+)?$'; then
     OLD=$(printf '%s' "$TITLE" | sed -E 's/.* from ([0-9]+\.[0-9]+\.[0-9]+) to [0-9]+\.[0-9]+\.[0-9]+$/\1/')
     NEW=$(printf '%s' "$TITLE" | sed -E 's/.* to ([0-9]+\.[0-9]+\.[0-9]+)$/\1/')
     if [ "$(printf '%s' "$OLD" | cut -d. -f1)" != "$(printf '%s' "$NEW" | cut -d. -f1)" ]; then TIER=major
