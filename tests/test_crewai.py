@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from mitrity.admission import Client
 from mitrity.crewai import CrewAIGovernor, GovernedTool, govern, govern_tools
-from tests.fake_edge import FakeEdge, allow, deny
+from tests.fake_edge import FakeEdge, allow, deny, held
 
 
 class ShellArgs(BaseModel):
@@ -220,3 +220,11 @@ def test_c27_a_multi_positional_rewrite_covers_every_argument_or_none(
         edge.script(allow(updated_input=partial))
         result = governed.run("a", "b")
         assert isinstance(result, ToolFailure) and "without covering" in result.message
+
+
+def test_held_is_a_tool_failure(edge: FakeEdge, client: Client) -> None:
+    edge.default_admit = held("apr-7")
+    result = govern(Terminal(), client=client).run(command="ls")
+    assert isinstance(result, ToolFailure)
+    assert "apr-7" in result.message and "human approval" in result.message
+    assert [r.body["hold_timeout_seconds"] for r in edge.admits()] == [0, 2]
