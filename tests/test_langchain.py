@@ -161,3 +161,13 @@ def test_governed_tool_is_a_base_tool_with_the_inner_schema(client: Client) -> N
     assert isinstance(tool, BaseTool)
     assert tool.tool_call_schema is inner.tool_call_schema
     assert tool.get_input_schema() is inner.get_input_schema()
+
+
+def test_a_rewrite_the_adapter_cannot_place_is_a_deny(edge: FakeEdge, client: Client) -> None:
+    # Judged bytes execute: a positional call whose rewrite names another key must not run
+    # the original value under a decision made about different bytes.
+    upper = Tool(name="upper", func=lambda text: str(text).upper(), description="Upper-case text")
+    tool = govern(upper, client=client)
+    edge.script(allow(updated_input={"command": "something else"}))
+    with pytest.raises(ToolException, match="cannot apply"):
+        tool.invoke("hi")

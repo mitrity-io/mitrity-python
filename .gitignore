@@ -23,3 +23,14 @@ htmlcov/
 
 # Agent worktrees
 .claude/worktrees/
+
+# Files the review workflows write into a checkout when run locally
+/diff.txt
+/diff_truncated.txt
+/diff_nolock.txt
+/review.md
+/verdict.txt
+/comment.md
+/comment_truncated.md
+/untrusted_input.md
+/pr.json

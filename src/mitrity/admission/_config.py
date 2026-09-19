@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import sys
@@ -50,6 +51,11 @@ _DURATION_UNITS = {
 }
 _DURATION_PART = re.compile(r"(\d+(?:\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h)")
 _BARE_NUMBER = re.compile(r"^[+-]?(\d+(?:\.\d*)?|\.\d+)$")
+# A loopback address is exactly host:port — no userinfo, path, query, fragment or
+# whitespace, so nothing an HTTP client could read as a different authority.
+_TCP_ADDR = re.compile(
+    r"^(?:\[(?P<bracket>[0-9A-Fa-f:.]+)\]|(?P<bare>[0-9A-Za-z.\-]+)):(?P<port>\d{1,5})$"
+)
 
 
 def platform_defaults() -> tuple[str, str]:
@@ -105,6 +111,44 @@ def split_addr(addr: str) -> tuple[Network, str]:
     return "tcp", addr
 
 
+def parse_loopback_addr(address: str) -> tuple[str, int]:
+    """Parse a loopback ``host:port`` strictly, returning the literal host and the port.
+
+    The address is parsed, never sliced: ``localhost:8777@attacker.example`` has a
+    loopback-looking prefix and an HTTP client would connect to the host after the
+    ``@``. Only ``host:port`` is accepted, the host must be a loopback IP literal —
+    ``localhost`` is taken as a spelling of ``127.0.0.1`` and never resolved, so a
+    hosts-file entry cannot point it off-box — and the port must be a number.
+    """
+    match = _TCP_ADDR.match(address)
+    if match is None:
+        raise AdmissionConfigError(
+            f"{ENV_ADDR}={address!r} is not a plain host:port: the admission address may carry "
+            "no userinfo, path, query, fragment or whitespace"
+        )
+    host = match.group("bracket") or match.group("bare")
+    port = int(match.group("port"))
+    if not 1 <= port <= 65535:
+        raise AdmissionConfigError(f"{ENV_ADDR}={address!r} has an invalid port")
+    if host == "localhost":
+        host = "127.0.0.1"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise AdmissionConfigError(
+            f"{ENV_ADDR}={address!r} is neither loopback nor a Unix socket: the admission API "
+            "carries the command this agent is about to run and its token, and a routable "
+            "address would send both to whatever answers there"
+        ) from exc
+    if not ip.is_loopback:
+        raise AdmissionConfigError(
+            f"{ENV_ADDR}={address!r} is neither loopback nor a Unix socket: the admission API "
+            "carries the command this agent is about to run and its token, and a routable "
+            "address would send both to whatever answers there"
+        )
+    return str(ip), port
+
+
 def validate_addr(addr: str) -> None:
     """Refuse an address that is neither loopback nor a Unix socket.
 
@@ -118,19 +162,7 @@ def validate_addr(addr: str) -> None:
         if not address:
             raise AdmissionConfigError(f"{ENV_ADDR}={addr!r} names no socket path")
         return
-    host = address
-    if ":" in address:
-        host = address.rsplit(":", 1)[0]
-    host = host.strip()
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-    if host in {"127.0.0.1", "::1", "localhost"}:
-        return
-    raise AdmissionConfigError(
-        f"{ENV_ADDR}={addr!r} is neither loopback nor a Unix socket: the admission API carries "
-        "the command this agent is about to run and its token, and a routable address would "
-        "send both to whatever answers there"
-    )
+    parse_loopback_addr(address)
 
 
 @dataclass(frozen=True)

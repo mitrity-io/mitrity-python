@@ -103,6 +103,7 @@ def test_empty_token_file_is_unreachable(edge: FakeEdge, tmp_path: Path) -> None
         (Scripted(status=200, body=b"not json"), AdmissionProtocolError),
         (Scripted(status=200, body={"decision": "maybe", "reason": "x"}), AdmissionProtocolError),
         (Scripted(status=200, body=allow().body, version="2"), AdmissionProtocolError),
+        (Scripted(status=200, body=allow().body, version=None), AdmissionProtocolError),
         (Scripted(status=200, body=[1, 2]), AdmissionProtocolError),
         (Scripted(status=500, body=b"boom"), AdmissionProtocolError),
     ],
@@ -241,3 +242,17 @@ async def test_async_client_speaks_the_same_wire(edge: FakeEdge, client: Client)
     edge.reject_all_tokens = True
     with pytest.raises(AdmissionUnauthorized):
         await client.admit_async(REQUEST)
+
+
+def test_attest_accepts_a_204_without_the_version_header(edge: FakeEdge, client: Client) -> None:
+    # The edge answers /v1/attest with a bare 204; only a decision needs the header.
+    edge.default_attest = Scripted(status=204, body=None, version=None, content_type=None)
+    client.attest(Attestation(framework="custom", adapter="mitrity-python", adapter_version="0"))
+    assert len(edge.attests()) == 1
+
+
+def test_tcp_url_is_built_from_the_parsed_literal(edge: FakeEdge) -> None:
+    client = Client(addr="localhost:1", token_file=str(edge.token_file), timeout=0.2)
+    assert client._url("/v1/admit") == "http://127.0.0.1:1/v1/admit"
+    v6 = Client(addr="[::1]:1", token_file=str(edge.token_file), timeout=0.2)
+    assert v6._url("/healthz") == "http://[::1]:1/healthz"

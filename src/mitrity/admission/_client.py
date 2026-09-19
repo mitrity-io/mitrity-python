@@ -17,7 +17,14 @@ from typing import Any
 
 import httpx
 
-from ._config import ATTEST_TIMEOUT, HOLD_MARGIN, Config, split_addr, validate_addr
+from ._config import (
+    ATTEST_TIMEOUT,
+    HOLD_MARGIN,
+    Config,
+    parse_loopback_addr,
+    split_addr,
+    validate_addr,
+)
 from ._errors import (
     AdmissionConfigError,
     AdmissionError,
@@ -102,6 +109,13 @@ def _interpret(status: int, body: bytes, headers: httpx.Headers, *, addr: str) -
         )
     if status == 204:
         return None
+    if status == 200 and version is None:
+        # Nothing authenticates the edge to the adapter; the version header is the one
+        # signal that the peer is a MITRITY edge. A decision without it is not obeyed.
+        raise AdmissionProtocolError(
+            f"admission API at {addr} answered without an {HEADER_VERSION} header — "
+            "not a MITRITY edge, or a protocol the adapter does not speak"
+        )
     if status == 503:
         raise AdmissionNotReady(f"the MITRITY edge is not ready to judge ({_reason_or(body)})")
     if status == 400:
@@ -171,6 +185,12 @@ class Client:
             # fail-closed means.
             self._config_error = exc
         self._network, self._address = split_addr(cfg.addr)
+        self._host = ""
+        self._port = 0
+        if self._network == "tcp" and self._config_error is None:
+            # The URL is built from the parsed literal host and port, never from
+            # the configured string, so nothing in it can name another authority.
+            self._host, self._port = parse_loopback_addr(self._address)
 
     @property
     def config(self) -> Config:
@@ -197,13 +217,14 @@ class Client:
         data = self._request("GET", "/healthz", None, timeout or self._config.timeout, auth=False)
         return data if isinstance(data, dict) else {}
 
-    def decide(self, request: AdmitRequest) -> Verdict:
+    def decide(self, request: AdmitRequest, *, hold_timeout: float | None = None) -> Verdict:
         """The two-phase decision: never raises, never fabricates an allow.
 
         Phase 1 asks with ``hold_timeout_seconds: 0`` under the deadline. Only
         a ``held`` answer starts phase 2, which re-submits with the hold budget
         so the edge long-polls the approval. Anything that goes wrong on
-        either phase is a deny naming what went wrong.
+        either phase is a deny naming what went wrong. ``hold_timeout`` caps
+        the configured budget for this call; it can never raise it.
         """
         try:
             first = self.admit(replace(request, hold_timeout_seconds=0))
@@ -211,7 +232,7 @@ class Client:
             return _unreachable_verdict(exc)
         if first.decision != "held":
             return _verdict_for(first)
-        budget = int(self._config.hold_timeout)
+        budget = self._hold_budget(hold_timeout)
         if budget <= 0:
             return _verdict_for(first)
         try:
@@ -244,14 +265,16 @@ class Client:
         )
         return data if isinstance(data, dict) else {}
 
-    async def decide_async(self, request: AdmitRequest) -> Verdict:
+    async def decide_async(
+        self, request: AdmitRequest, *, hold_timeout: float | None = None
+    ) -> Verdict:
         try:
             first = await self.admit_async(replace(request, hold_timeout_seconds=0))
         except AdmissionError as exc:
             return _unreachable_verdict(exc)
         if first.decision != "held":
             return _verdict_for(first)
-        budget = int(self._config.hold_timeout)
+        budget = self._hold_budget(hold_timeout)
         if budget <= 0:
             return _verdict_for(first)
         try:
@@ -263,6 +286,12 @@ class Client:
         return _verdict_for(second)
 
     # -------------------------------------------------------------- plumbing
+
+    def _hold_budget(self, cap: float | None) -> int:
+        budget = self._config.hold_timeout
+        if cap is not None:
+            budget = min(budget, max(cap, 0.0))
+        return int(budget)
 
     def _log(self, request: AdmitRequest, decision: Decision, started: float) -> None:
         # The tool input never reaches a log record, and neither does the
@@ -281,7 +310,8 @@ class Client:
     def _url(self, path: str) -> str:
         if self._network == "unix":
             return f"http://{_HOST}{path}"
-        return f"http://{self._address}{path}"
+        host = f"[{self._host}]" if ":" in self._host else self._host
+        return f"http://{host}:{self._port}{path}"
 
     def _headers(self, token: str | None, payload: bytes | None) -> dict[str, str]:
         headers = {"Host": _HOST, HEADER_VERSION: PROTOCOL_VERSION}

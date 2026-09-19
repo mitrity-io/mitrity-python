@@ -22,9 +22,11 @@ def test_canonical_json_orders_keys_by_utf16_code_units() -> None:
     assert canonical_json({"～": 1, "\U0001d11e": 2}) == '{"\U0001d11e":2,"～":1}'
 
 
-def test_canonical_json_refuses_floats() -> None:
+def test_canonical_json_refuses_floats_and_bytes() -> None:
     with pytest.raises(TypeError):
         canonical_json({"risk": 0.5})
+    with pytest.raises(TypeError):
+        canonical_json({"raw": b"hi"})
 
 
 def test_config_hash_is_sha256_hex() -> None:

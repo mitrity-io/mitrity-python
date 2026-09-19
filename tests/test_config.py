@@ -14,6 +14,7 @@ from mitrity.admission import (
     AdmissionConfigError,
     Config,
     parse_duration,
+    parse_loopback_addr,
     split_addr,
     validate_addr,
 )
@@ -71,7 +72,27 @@ def test_validate_addr_accepts_loopback_and_sockets(addr: str) -> None:
 
 @pytest.mark.parametrize(
     "addr",
-    ["0.0.0.0:8777", ":8777", "10.0.0.5:8777", "example.com:80", "[2001:db8::1]:8777", "unix:"],
+    [
+        "0.0.0.0:8777",
+        ":8777",
+        "10.0.0.5:8777",
+        "example.com:80",
+        "[2001:db8::1]:8777",
+        "unix:",
+        # URL-authority confusion: a loopback-looking prefix in front of another host.
+        "localhost:8777@attacker.example",
+        "127.0.0.1:8777@attacker.example:80",
+        "127.0.0.1:8777/../x",
+        "127.0.0.1:8777?x=1",
+        "127.0.0.1:8777#f",
+        "127.0.0.1",
+        "127.0.0.1:abc",
+        "127.0.0.1:0",
+        "127.0.0.1:70000",
+        "127.0.0.1:8777 ",
+        " 127.0.0.1:8777",
+        "[::1]:8777@attacker.example",
+    ],
 )
 def test_validate_addr_refuses_routable_addresses(addr: str) -> None:
     with pytest.raises(AdmissionConfigError):
@@ -110,3 +131,10 @@ def test_config_clamps_timeouts_to_the_hook_ceilings() -> None:
     zero = Config(addr="unix:/x", token_file="/t", timeout=0, hold_timeout=-5)
     assert zero.timeout == DEFAULT_TIMEOUT
     assert zero.hold_timeout == 0.0
+
+
+def test_localhost_is_a_spelling_of_the_ipv4_loopback_literal() -> None:
+    # Never resolved: a hosts-file entry cannot point it off-box.
+    assert parse_loopback_addr("localhost:8777") == ("127.0.0.1", 8777)
+    assert parse_loopback_addr("127.0.0.2:1") == ("127.0.0.2", 1)
+    assert parse_loopback_addr("[::1]:8777") == ("::1", 8777)

@@ -93,6 +93,9 @@ def held(approval_id: str = "apr-1") -> Scripted:
 class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
+    # A real edge listens with the kernel's backlog; socketserver's default of 5
+    # refuses connections under a burst of concurrent hook calls.
+    request_queue_size = 128
 
 
 class FakeEdge:

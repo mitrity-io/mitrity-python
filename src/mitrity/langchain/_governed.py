@@ -257,9 +257,16 @@ def _apply_verdict(
         logger.info("MITRITY routed %s to %s", tool.name, verdict.routed_to)
     updated = dict(verdict.updated_input)
     if args:
+        # A positional call has exactly one place a rewrite can land. A rewrite
+        # the adapter cannot place would leave the original value to run under
+        # a decision made about different bytes, so it is a deny.
         key = _positional_key(tool)
-        if key in updated:
-            args = (updated.pop(key), *args[1:])
+        if key not in updated or set(updated) != {key}:
+            raise ToolException(
+                f"MITRITY rewrote the input of {tool.name} in a way the adapter cannot apply "
+                f"(keys {sorted(updated)!r}); the call was blocked rather than run unchanged"
+            )
+        args = (updated.pop(key), *args[1:])
     return args, {**kwargs, **updated}
 
 
@@ -267,7 +274,10 @@ def _positional_key(tool: BaseTool) -> str:
     """The wire key for one positional argument: the single declared argument, else ``input``."""
     try:
         declared = list(tool.args)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "MITRITY: could not introspect the arguments of %s (%r); using 'input'", tool.name, exc
+        )
         declared = []
     return declared[0] if len(declared) == 1 else "input"
 

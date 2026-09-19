@@ -3,11 +3,8 @@ name: Security Review Agent
 on:
   pull_request:
     types: [opened, synchronize]
-    paths:
-      - "**/*.py"
-      - "pyproject.toml"
-      - ".github/workflows/**"
-      - ".github/scripts/**"
+    # No paths filter: every change to this repository is security-relevant, and the
+    # auto-merge gate derives "security review required" from this trigger.
 
 permissions:
   contents: read

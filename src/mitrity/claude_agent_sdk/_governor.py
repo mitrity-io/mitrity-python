@@ -27,7 +27,9 @@ from claude_agent_sdk.types import HookEvent, McpServerConfig, SyncHookJSONOutpu
 import mitrity
 from mitrity.admission import (
     ADAPTER_NAME,
+    ATTEST_TIMEOUT,
     EXEC_CAPABLE_TOOLS,
+    HOLD_MARGIN,
     AdmissionError,
     AdmitRequest,
     Attestation,
@@ -48,7 +50,9 @@ ALL_SETTING_SOURCES: tuple[str, ...] = ("user", "project", "local")
 _ADMITTED_MEMORY = 4096
 _ATTEST_RETRY_SECONDS = 30.0
 _FRAMEWORK_HOOK_BUDGET = 600.0
+_HOOK_SLACK = 30.0
 _POST_HOOK_TIMEOUT = 30.0
+_REASON_LIMIT = 200
 
 logger = logging.getLogger("mitrity.claude_agent_sdk")
 
@@ -109,6 +113,7 @@ class Governor:
         self._admitted: OrderedDict[str, None] = OrderedDict()
         self._attested: dict[str, str] = {}
         self._attest_attempted: dict[str, float] = {}
+        self._attest_inflight: set[str] = set()
         self.stats = GovernorStats()
 
     @property
@@ -215,12 +220,28 @@ class Governor:
 
         return ClaudeAgentOptions(mcp_servers=mcp_servers, hooks=hooks, **overrides)
 
+    def _budgets(self) -> tuple[float, float]:
+        """The hold budget one decision may spend, and the matcher timeout that contains it.
+
+        The adapter must be the one that answers (adapters.md G3), so every term
+        it can spend inside one PreToolUse — the attestation, the decision
+        deadline, the hold wait, the hold margin — plus slack has to fit under
+        the framework's own 600 s hook budget. The hold budget is what gives
+        when it does not: waiting less on a human is a deny the operator can
+        see; a hook the framework kills is a decision nobody made.
+        """
+        cfg = self._client.config
+        fixed = ATTEST_TIMEOUT + cfg.timeout + HOLD_MARGIN + _HOOK_SLACK
+        hold = min(cfg.hold_timeout, max(0.0, _FRAMEWORK_HOOK_BUDGET - fixed))
+        return hold, min(_FRAMEWORK_HOOK_BUDGET, fixed + hold)
+
     def _hook_timeout(self) -> float:
-        # The adapter must be the one that answers (adapters.md G3): its own
-        # worst case is the decision deadline plus the hold budget plus the
-        # margin, so the framework's timeout sits comfortably above that and
-        # under the framework's own 600 s budget.
-        return min(_FRAMEWORK_HOOK_BUDGET, self._client.config.hold_timeout + 30.0)
+        return self._budgets()[1]
+
+    @property
+    def hold_budget(self) -> float:
+        """Seconds one decision may wait on a human approval, after the budget fit."""
+        return self._budgets()[0]
 
     # ------------------------------------------------------------ attestation
 
@@ -282,12 +303,18 @@ class Governor:
             and session_id not in self._attested
         ):
             return
+        if session_id in self._attest_inflight:
+            # A burst of concurrent hook calls at session start attests once, not once per call.
+            return
         self._attest_attempted[session_id] = now
+        self._attest_inflight.add(session_id)
         try:
             await self._client.attest_async(attestation)
         except AdmissionError as exc:
             self._logger.warning("MITRITY: could not report the runtime posture: %s", exc)
             return
+        finally:
+            self._attest_inflight.discard(session_id)
         self._attested[session_id] = digest
         self.stats.attestations += 1
 
@@ -319,14 +346,14 @@ class Governor:
                 tool_input=tool_input,
                 tool_use_id=call_id,
             )
-            verdict = await self._client.decide_async(request)
+            verdict = await self._client.decide_async(request, hold_timeout=self.hold_budget)
         except Exception as exc:
             self.stats.unreachable += 1
             self._logger.error(
                 "MITRITY: admission of %s failed inside the adapter: %r", tool_name, exc
             )
             return _deny(
-                f"MITRITY could not authorize this action and blocked it: {exc!r}. "
+                f"MITRITY could not authorize this action and blocked it: {_bound(repr(exc))}. "
                 "This is not a policy decision — the adapter failed before the edge answered."
             )
 
@@ -361,7 +388,7 @@ class Governor:
         if verdict.held:
             output["systemMessage"] = (
                 f"MITRITY held {tool_name} for human approval and it was not approved within "
-                f"the hold budget ({int(self._client.config.hold_timeout)}s)."
+                f"the hold budget ({int(self.hold_budget)}s)."
             )
         return output
 
@@ -424,6 +451,11 @@ class Governor:
 
 
 _MISSING = object()
+
+
+def _bound(text: str) -> str:
+    """Bound text that reaches the model's context, as the client bounds error bodies."""
+    return text if len(text) <= _REASON_LIMIT else text[:_REASON_LIMIT] + "…"
 
 
 def _optional_str(value: Any) -> str | None:

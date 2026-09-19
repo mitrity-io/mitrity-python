@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from ._errors import AdmissionError, AdmissionProtocolError
@@ -209,7 +209,6 @@ class Attestation:
     permission_mode: str | None = None
     sandbox: SandboxPosture | None = None
     config_hash: str | None = None
-    extra: Mapping[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -233,5 +232,4 @@ class Attestation:
             body["sandbox"] = self.sandbox.to_wire()
         if self.config_hash:
             body["config_hash"] = self.config_hash
-        body.update(self.extra)
         return body

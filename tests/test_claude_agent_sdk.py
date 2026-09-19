@@ -84,7 +84,8 @@ def test_options_shape(client: Client) -> None:
     hooks = options.hooks or {}
     pre = hooks["PreToolUse"][0]
     assert pre.matcher == "|".join(EXEC_CAPABLE_TOOLS)
-    assert pre.timeout == client.config.hold_timeout + 30.0
+    # attest 5 s + decision 0.5 s + hold 2 s + margin 5 s + slack 30 s
+    assert pre.timeout == 42.5
     assert hooks["PostToolUse"][0].matcher is None
     assert hooks["UserPromptSubmit"][0].matcher is None
 
@@ -225,7 +226,7 @@ async def test_adapter_failure_is_a_deny_not_an_exception(edge: FakeEdge, client
     gov = governor(client)
     gov.options()
 
-    async def explode(request: AdmitRequest) -> Verdict:
+    async def explode(request: AdmitRequest, **kwargs: Any) -> Verdict:
         raise RuntimeError("boom")
 
     cast("Any", client).decide_async = explode
@@ -419,3 +420,49 @@ async def test_attestation_failure_never_blocks_a_call(edge: FakeEdge, client: C
     out = await gov.pre_tool_use(hook_input("Bash", {"command": "ls"}), "t", CONTEXT)
     assert out == {}
     assert gov.stats.attestations == 0
+
+
+def test_hook_budget_fits_the_framework_budget(edge: FakeEdge) -> None:
+    # Every term the adapter can spend inside one hook has to fit under 600 s; the hold
+    # budget is what gives.
+    client = Client(
+        addr=edge.addr, token_file=str(edge.token_file), timeout=30.0, hold_timeout=570.0
+    )
+    gov = governor(client)
+    options = gov.options()
+    pre = (options.hooks or {})["PreToolUse"][0]
+    assert pre.timeout == 600.0
+    assert gov.hold_budget == 600.0 - (5.0 + 30.0 + 5.0 + 30.0)
+    assert gov.hold_budget < client.config.hold_timeout
+
+
+@pytest.mark.anyio
+async def test_hold_wait_uses_the_fitted_budget(edge: FakeEdge) -> None:
+    from tests.fake_edge import HoldScript
+    from tests.fake_edge import allow as allow_response
+
+    client = Client(
+        addr=edge.addr, token_file=str(edge.token_file), timeout=30.0, hold_timeout=570.0
+    )
+    edge.default_admit = HoldScript(outcome=allow_response())
+    gov = governor(client)
+    gov.options()
+    out = await gov.pre_tool_use(hook_input("Bash", {"command": "x"}), "t", CONTEXT)
+    assert out == {}
+    budgets = [r.body["hold_timeout_seconds"] for r in edge.admits()]
+    assert budgets == [0, int(gov.hold_budget)]
+
+
+@pytest.mark.anyio
+async def test_adapter_failure_reason_is_bounded(edge: FakeEdge, client: Client) -> None:
+    gov = governor(client)
+    gov.options()
+
+    async def explode(request: AdmitRequest, **kwargs: Any) -> Verdict:
+        raise RuntimeError("x" * 5000)
+
+    cast("Any", client).decide_async = explode
+    out = cast(
+        "dict[str, Any]", await gov.pre_tool_use(hook_input("Bash", {"command": "x"}), "t", CONTEXT)
+    )
+    assert len(out["hookSpecificOutput"]["permissionDecisionReason"]) < 400

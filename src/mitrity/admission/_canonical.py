@@ -52,6 +52,8 @@ def canonical_json(value: Any) -> str:  # noqa: PLR0911 — one return per JSON 
         return str(value)
     if isinstance(value, str):
         return _escape(value)
+    if isinstance(value, bytes | bytearray | memoryview):
+        raise TypeError("canonical_json does not serialize bytes")
     if isinstance(value, Mapping):
         items = sorted(
             ((str(key), inner) for key, inner in value.items()),
