@@ -44,9 +44,11 @@
 # gate; they are retargeted by hand once their base has landed.
 #
 # Merging is verified, not assumed: the PR's merge state must be CLEAN (every
-# required check green, no conflict) at the verified head, because the merge
-# token belongs to an administrator and branch protection does not bind
-# administrators here. Dependabot PRs are left to their own gate.
+# required check green, no conflict) at the verified head, and every status
+# check that branch protection requires is read back green from the checks
+# themselves. The merge token is a fine-grained token with contents and
+# pull-request rights and no administration permission; the gate does not
+# rely on that, it verifies. Dependabot PRs are left to their own gate.
 #
 # Whether the security agent is required is derived from facts a PR cannot
 # influence from its branch: the base branch's security-review.yml path filter
@@ -69,8 +71,8 @@ clean() { printf '%s' "$*" | tr -d '\000-\037' | cut -c1-200; }     # PR-influen
 merge_now() {
   # The merge state is GitHub's own verdict on required checks, conflicts and
   # review requirements; it can be UNKNOWN for a moment after a push. It is
-  # re-read immediately before every merge attempt, because the merge token
-  # is an administrator's and branch protection would not re-check for it.
+  # re-read immediately before every merge attempt so that a push or a check
+  # that landed while the reviews were being evaluated is never merged over.
   for ATTEMPT in 1 2 3; do
     MS=$(gh pr view "$PR" --repo "$REPO" --json mergeStateStatus,headRefOid --jq '"\(.mergeStateStatus) \(.headRefOid)"' 2>/dev/null) || MS=""
     [ -n "$MS" ] || { say "::warning::Not merged: could not read the merge state of #$PR (API failure); the next completion re-evaluates"; return 0; }
@@ -85,9 +87,18 @@ merge_now() {
     # The merge state is not the only witness: every status check that branch
     # protection requires must be green at this head, read from the checks
     # themselves. The required contexts come from the branch object, which
-    # read access can see; the branch-protection endpoints need administration
-    # rights the merge token does not hold, and an unreadable list is a refusal.
-    REQUIRED_CTX=$(gh api "repos/$REPO/branches/$BASE_REF" --jq '.protection.required_status_checks.contexts // [] | .[]' 2>/dev/null) || { say "::warning::Not merged: could not read the required status checks"; return 0; }
+    # read access can see (the branch-protection endpoints need administration
+    # rights). Every degraded case is a refusal: an API error, a protection
+    # block that is absent or not enabled (a token that cannot see it, or a
+    # branch governed by rulesets, which never appear here), and a protection
+    # that names no required check at all.
+    BRANCH_JSON=$(gh api "repos/$REPO/branches/$BASE_REF" 2>&1) || { say "::warning::Not merged: could not read branch $BASE_REF: $(clean "$BRANCH_JSON")"; return 0; }
+    PROT_ENABLED=$(printf '%s' "$BRANCH_JSON" | jq -r '.protection.enabled // false' 2>/dev/null) || PROT_ENABLED=""
+    [ "$PROT_ENABLED" = "true" ] || { say "::warning::Not merged: branch protection on $BASE_REF is not visible to the merge token (enabled=$(clean "${PROT_ENABLED:-unreadable}"))"; return 0; }
+    # Both spellings of the required list: checks[].context (current) and the
+    # contexts mirror (kept for compatibility); a check named in either counts.
+    REQUIRED_CTX=$(printf '%s' "$BRANCH_JSON" | jq -r '.protection.required_status_checks | select(type == "object") | (((.checks // []) | map(.context)) + (.contexts // [])) | map(select(type == "string" and length > 0)) | unique | .[]' 2>/dev/null) || REQUIRED_CTX=""
+    [ -n "$REQUIRED_CTX" ] || { say "::warning::Not merged: branch protection on $BASE_REF names no required status check"; return 0; }
     ROLLUP_JSON=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '.statusCheckRollup' 2>/dev/null) || { say "::warning::Not merged: could not read the checks"; return 0; }
     MISSING=""
     while IFS= read -r CTX; do
