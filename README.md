@@ -157,9 +157,12 @@ The session id is, in order: the `session_id` you pass, the
 from agents import Agent, Runner, ShellTool, function_tool
 from mitrity.openai_agents import govern
 
+
 @function_tool
 def run_command(command: str) -> str:
+    """Run a shell command on the build host and return its output."""
     ...
+
 
 agent = govern(Agent(name="ops", tools=[run_command, ShellTool(executor=my_executor)]))
 result = await Runner.run(agent, "clean up the build directory")
