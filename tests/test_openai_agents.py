@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, TypeVar, cast
 
@@ -25,8 +26,10 @@ from agents import (
     Usage,
     WebSearchTool,
     function_tool,
+    handoff,
 )
 from agents.editor import ApplyPatchOperation
+from agents.handoffs import Handoff
 from agents.items import ToolApprovalItem, ToolCallOutputItem, TResponseStreamEvent
 from agents.mcp import MCPServer
 from agents.models.interface import Model
@@ -514,3 +517,62 @@ def test_model_settings_untouched(client: Client) -> None:
     agent = Agent(name="a", tools=[run_command], model_settings=ModelSettings(temperature=0.1))
     governed = govern(agent, client=client)
     assert governed.model_settings == agent.model_settings and governed.name == "a"
+
+
+# -------------------------------------------------------- handoffs and tool types
+
+
+def governed_names(agent: Agent[Any]) -> list[str]:
+    return [
+        t.name
+        for t in agent.tools
+        if isinstance(t, FunctionTool)
+        and any(g.get_name() == GUARDRAIL_NAME for g in t.tool_input_guardrails or [])
+    ]
+
+
+def test_govern_terminates_on_a_handoff_cycle(client: Client) -> None:
+    triage = Agent(name="triage", tools=[run_command])
+    faq = Agent(name="faq", tools=[run_command], handoffs=[triage])
+    triage.handoffs.append(faq)
+    governed = govern(triage, client=client)
+    (faq_governed,) = governed.handoffs
+    assert isinstance(faq_governed, Agent) and faq_governed is not faq
+    assert governed_names(faq_governed) == ["run_command"]
+    (back,) = faq_governed.handoffs
+    assert back is governed, "the hand-back resolves to the one governed triage clone"
+    assert triage.handoffs == [faq] and faq.handoffs == [triage], "the originals are untouched"
+
+
+def test_govern_shares_one_clone_across_a_diamond(client: Client) -> None:
+    leaf = Agent(name="leaf", tools=[run_command])
+    left = Agent(name="left", handoffs=[leaf])
+    right = Agent(name="right", handoffs=[leaf])
+    root = Agent(name="root", handoffs=[left, right])
+    governed = govern(root, client=client)
+    left_governed, right_governed = governed.handoffs
+    assert isinstance(left_governed, Agent) and isinstance(right_governed, Agent)
+    (via_left,) = left_governed.handoffs
+    (via_right,) = right_governed.handoffs
+    assert via_left is via_right and via_left is not leaf
+    assert isinstance(via_left, Agent) and governed_names(via_left) == ["run_command"]
+
+
+def test_govern_agent_is_idempotent(client: Client) -> None:
+    governor = OpenAIAgentsGovernor(client=client)
+    once = govern(Agent(name="a", tools=[run_command]), governor=governor)
+    assert govern(once, governor=governor) is once
+    parent = govern(Agent(name="p", handoffs=[once]), governor=governor)
+    assert parent.handoffs == [once]
+
+
+def test_handoff_objects_are_left_as_is_with_a_warning(
+    client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    child = Agent(name="child", tools=[run_command])
+    built = handoff(child)
+    parent = Agent(name="parent", handoffs=[built])
+    with caplog.at_level(logging.WARNING, logger="mitrity.openai_agents"):
+        governed = govern(parent, client=client)
+    assert governed.handoffs == [built] and isinstance(built, Handoff)
+    assert "handoff()" in caplog.text

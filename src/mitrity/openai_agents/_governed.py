@@ -164,6 +164,10 @@ class OpenAIAgentsGovernor:
         return self._client
 
     @property
+    def logger(self) -> logging.Logger:
+        return self._logger
+
+    @property
     def hooked_tools(self) -> tuple[str, ...]:
         return tuple(self._hooked)
 
@@ -702,26 +706,55 @@ def govern(
     """A clone of ``agent`` whose tools are admitted by the MITRITY edge before they run.
 
     Handoff targets given as ``Agent`` objects are governed with the same
-    governor; a ``Handoff`` object is left as is. MCP servers on the agent are
-    not touched: the MITRITY gateway governs its own tools, every other server
-    is attested as an ungoverned path.
+    governor, each agent once however many paths reach it, so a handoff
+    cycle (a specialist handing back to the triage agent) or a diamond
+    terminates on one clone per agent. A ``Handoff`` object is left as is.
+    An agent ``govern`` already cloned is returned as it is. MCP servers on
+    the agent are not touched: the MITRITY gateway governs its own tools,
+    every other server is attested as an ungoverned path.
     """
     shared = (
         governor
         if governor is not None
         else OpenAIAgentsGovernor(client=client, session_id=session_id, cwd=cwd, gateway=gateway)
     )
-    tools = govern_tools(agent.tools, governor=shared)
+    return _govern_agent(agent, shared, {})
+
+
+def _govern_agent(
+    agent: Agent[Any], governor: OpenAIAgentsGovernor, visited: dict[int, Agent[Any]]
+) -> Agent[Any]:
+    seen = visited.get(id(agent))
+    if seen is not None:
+        return seen
+    if getattr(agent, _GOVERNED_MARKER, False):
+        # A clone an earlier govern() made: its tools are wrapped and its
+        # handoffs were governed with it, so it is returned as it is.
+        visited[id(agent)] = agent
+        return agent
+    tools = govern_tools(agent.tools, governor=governor)
     for server in agent.mcp_servers:
-        if not shared.is_gateway(server):
-            shared.register_mcp_server(server.name)
+        if not governor.is_gateway(server):
+            governor.register_mcp_server(server.name)
+    clone = agent.clone(tools=tools, handoffs=[])
+    setattr(clone, _GOVERNED_MARKER, True)
+    # Registered before the handoffs are walked, so a target that hands back
+    # to this agent finds the clone instead of recursing into it again.
+    visited[id(agent)] = clone
     handoffs: list[Any] = []
     for target in agent.handoffs:
         if isinstance(target, Agent):
-            handoffs.append(govern(target, governor=shared))
+            handoffs.append(_govern_agent(target, governor, visited))
         else:
+            governor.logger.warning(
+                "MITRITY: handoff %s on agent %s was built with handoff(); its agent is "
+                "governed only if you governed it before building the handoff",
+                getattr(target, "tool_name", None) or getattr(target, "agent_name", "?"),
+                agent.name,
+            )
             handoffs.append(target)
-    return agent.clone(tools=tools, handoffs=handoffs)
+    clone.handoffs = handoffs
+    return clone
 
 
 __all__ = [
