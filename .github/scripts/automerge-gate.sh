@@ -84,8 +84,10 @@ merge_now() {
     fi
     # The merge state is not the only witness: every status check that branch
     # protection requires must be green at this head, read from the checks
-    # themselves, because the merge token is an administrator's.
-    REQUIRED_CTX=$(gh api "repos/$REPO/branches/$BASE_REF/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null) || { say "::warning::Not merged: could not read the required status checks"; return 0; }
+    # themselves. The required contexts come from the branch object, which
+    # read access can see; the branch-protection endpoints need administration
+    # rights the merge token does not hold, and an unreadable list is a refusal.
+    REQUIRED_CTX=$(gh api "repos/$REPO/branches/$BASE_REF" --jq '.protection.required_status_checks.contexts // [] | .[]' 2>/dev/null) || { say "::warning::Not merged: could not read the required status checks"; return 0; }
     ROLLUP_JSON=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '.statusCheckRollup' 2>/dev/null) || { say "::warning::Not merged: could not read the checks"; return 0; }
     MISSING=""
     while IFS= read -r CTX; do
