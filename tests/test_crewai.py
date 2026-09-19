@@ -175,3 +175,27 @@ def test_usage_limit_is_the_frameworks(edge: FakeEdge, client: Client) -> None:
     result = governed.run(command="ls")
     assert isinstance(result, ToolFailure) and "usage limit" in result.message
     assert len(edge.admits()) == 1, "a call the framework refused is never admitted"
+
+
+def always_cache(_args: Any = None, _result: Any = None) -> bool:
+    """A ``cache_function`` that says yes to everything: what a governed tool must not keep."""
+    return True
+
+
+def test_a_governed_tool_never_caches(client: Client) -> None:
+    inner = Terminal()
+    assert inner.cache_function({"command": "ls"}, "ran ls") is True, "CrewAI caches by default"
+    governed = govern(inner, client=client)
+    assert governed.cache_function({"command": "ls"}, "ran ls") is False
+    # The structured tool CrewAI's agents call carries the same answer.
+    structured = governed.to_structured_tool()
+    assert structured.cache_function({"command": "ls"}, "ran ls") is False
+    # Even when a caching function is handed to the constructor directly.
+    direct = GovernedTool(
+        inner=inner,
+        governor=CrewAIGovernor(client=client),
+        name="terminal",
+        description="Run a command",
+        cache_function=always_cache,
+    )
+    assert direct.cache_function({"command": "ls"}, "ran ls") is False

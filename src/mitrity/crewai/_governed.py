@@ -8,6 +8,10 @@ carrying the edge's reason on a deny — the framework's declared channel for a
 tool that did not do what it was asked, recorded and policy-driven — run the
 edge's ``updated_input`` when it sends one, and only then call the tool.
 
+A governed tool never serves a cached result: CrewAI's tool cache would
+replay an earlier result for the same arguments without the edge judging
+the call again, so the governed tool's ``cache_function`` always says no.
+
 Coverage is exactly what you hand it: the tools CrewAI adds to an agent
 itself (delegation, the code interpreter behind ``allow_code_execution``, MCP
 tools from ``mcps``) never pass through ``govern`` and are invisible here.
@@ -170,11 +174,31 @@ class CrewAIGovernor:
         )
 
 
+def _never_cache(_args: Any = None, _result: Any = None) -> bool:
+    """A governed tool's ``cache_function``: never.
+
+    CrewAI's ``ToolUsage`` reads its cache by tool name and arguments before
+    the tool is reached, and writes to it only when the tool's
+    ``cache_function`` agrees. A cached result served to a repeated call is an
+    execution the edge never judged again — a policy revoked between the two
+    calls would not apply, and the audit trail would be silent about the
+    repeat — so a governed tool never lets a result into the cache. Every
+    governed call is a new decision, whatever the inner tool's setting.
+    """
+    return False
+
+
 class GovernedTool(BaseTool):
     """A ``BaseTool`` that admits every call through the MITRITY edge before running ``inner``."""
 
     inner: BaseTool
     governor: CrewAIGovernor
+
+    def model_post_init(self, context: Any, /) -> None:
+        super().model_post_init(context)
+        # Whatever was passed in, the governed tool never serves a cached
+        # result without a new decision; see _never_cache.
+        self.cache_function = _never_cache
 
     def _run(self, *args: Any, **kwargs: Any) -> Any:
         session_id = self.governor.session_id()
@@ -273,7 +297,8 @@ def govern(
         env_vars=list(tool.env_vars),
         args_schema=tool.args_schema,
         result_schema=tool.result_schema,
-        cache_function=tool.cache_function,
+        # Not the inner tool's cache_function: a governed tool never caches.
+        cache_function=_never_cache,
         result_as_answer=tool.result_as_answer,
         max_usage_count=tool.max_usage_count,
         tool_failure_policy=tool.tool_failure_policy,
