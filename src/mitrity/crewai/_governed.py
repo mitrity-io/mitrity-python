@@ -257,7 +257,23 @@ def _apply_verdict(
                     f"(keys {sorted(updated)!r}); the call was blocked rather than run unchanged"
                 )
             )
-        args = (updated.pop(key), *args[1:])
+        value = updated.pop(key)
+        if len(args) == 1:
+            args = (value,)
+        elif isinstance(value, list) and len(value) == len(args):
+            # The edge judged every positional argument as one list under the
+            # key and rewrote that list: each position takes its rewrite.
+            args = tuple(value)
+        else:
+            # A rewrite that does not cover every judged argument would leave
+            # the rest to run unchanged under a decision made about the whole.
+            return ToolFailure(
+                message=(
+                    f"MITRITY rewrote the {len(args)} positional arguments of {tool.name} "
+                    "without covering each of them; the call was blocked rather than run "
+                    "partly unchanged"
+                )
+            )
     return args, {**kwargs, **updated}
 
 

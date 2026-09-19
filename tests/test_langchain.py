@@ -171,3 +171,18 @@ def test_a_rewrite_the_adapter_cannot_place_is_a_deny(edge: FakeEdge, client: Cl
     edge.script(allow(updated_input={"command": "something else"}))
     with pytest.raises(ToolException, match="cannot apply"):
         tool.invoke("hi")
+
+
+def test_a_multi_positional_rewrite_covers_every_argument_or_none(
+    edge: FakeEdge, client: Client
+) -> None:
+    pair = Tool(name="pair", func=lambda left, right: f"{left}+{right}", description="Two")
+    tool = govern(pair, client=client)
+    assert tool._run("a", "b") == "a+b"
+    assert edge.admits()[0].body["tool_input"] == {"tool_input": ["a", "b"]}
+    edge.script(allow(updated_input={"tool_input": ["x", "y"]}))
+    assert tool._run("a", "b") == "x+y"
+    for partial in ({"tool_input": ["x"]}, {"tool_input": "x"}):
+        edge.script(allow(updated_input=partial))
+        with pytest.raises(ToolException, match="without covering"):
+            tool._run("a", "b")

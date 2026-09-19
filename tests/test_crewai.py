@@ -199,3 +199,24 @@ def test_a_governed_tool_never_caches(client: Client) -> None:
         cache_function=always_cache,
     )
     assert direct.cache_function({"command": "ls"}, "ran ls") is False
+
+
+def test_c27_a_multi_positional_rewrite_covers_every_argument_or_none(
+    edge: FakeEdge, client: Client
+) -> None:
+    class Pair(BaseTool):
+        name: str = "pair"
+        description: str = "Two positionals"
+
+        def _run(self, left: str, right: str) -> str:
+            return f"{left}+{right}"
+
+    governed = govern(Pair(), client=client)
+    assert governed.run("a", "b") == "a+b"
+    assert edge.admits()[0].body["tool_input"] == {"input": ["a", "b"]}
+    edge.script(allow(updated_input={"input": ["x", "y"]}))
+    assert governed.run("a", "b") == "x+y"
+    for partial in ({"input": ["x"]}, {"input": "x"}, {"input": ["x", "y", "z"]}):
+        edge.script(allow(updated_input=partial))
+        result = governed.run("a", "b")
+        assert isinstance(result, ToolFailure) and "without covering" in result.message
