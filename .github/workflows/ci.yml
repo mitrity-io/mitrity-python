@@ -4,6 +4,11 @@ on:
   pull_request:
     branches: [main]
 
+# Every job here runs code from the PR head; the token it can reach is
+# read-only, so nothing executed here can post a review or a comment.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint
