@@ -179,10 +179,17 @@ blocked the way the SDK itself blocks that type:
   function receives.
 - **`ShellTool`** and **`ApplyPatchTool`** go through the SDK's approval
   flow: the adapter's `needs_approval` asks the edge, and on a deny its
-  `on_approval` rejects the call with the reason. Your own `needs_approval`
-  and `on_approval` still apply when MITRITY allows. The shell executor runs
-  the edge's rewritten `commands` when it sends them; an `apply_patch`
-  rewrite is a deny (the editor has no call id to apply it to).
+  `on_approval` rejects the call with the reason — as it rejects an approval
+  it cannot tie to a decision it made. Your own `needs_approval` and
+  `on_approval` still apply when MITRITY allows. The execution channel is
+  gated as well: the wrapped shell executor and the wrapped `apply_patch`
+  editor re-check the decision `needs_approval` made, and admit a call the
+  SDK runs without asking (an approved call on a resumed run); a deny there
+  reaches the model as the tool's failed output. The shell executor runs the
+  edge's rewritten `commands` when it sends them; an `apply_patch` rewrite
+  is a deny (the editor receives the operation alone, with nothing to apply
+  a rewrite to). A `ShellTool` whose `environment` is a hosted container
+  runs in OpenAI's cloud and passes through like the hosted tools below.
 - **`LocalShellTool`** (deprecated upstream) has neither a guardrail nor an
   approval, so a deny is returned as the executor's output with nothing run.
 - **Hosted tools** (web search, file search, code interpreter, image
@@ -190,11 +197,21 @@ blocked the way the SDK itself blocks that type:
   computer the SDK does not judge: they pass through untouched and are
   reported as ungoverned in the attestation.
 
+Judged bytes are the executed bytes. A decision is kept for the tool, the
+SDK's `call_id` and a digest of the input it was made for; the invoker,
+executor or editor reuses it only for that exact input, and an execution
+whose input differs from what the edge judged raises `MitrityDenied` rather
+than running under that decision.
+
 MCP servers on the agent are not touched. Pass the MITRITY gateway server as
 `gateway=` so it is not reported as ungoverned; every other server is. The
 session id is, in order: the `session_id` you pass, `RunConfig.group_id`, or
 one id per process. Handoff targets given as `Agent` objects are governed
-too; a `Handoff` object is left as is.
+too, once each — a specialist handing back to the triage agent, or two paths
+to the same agent, resolve to one governed clone; a `Handoff` object built
+with `handoff()` is left as is, so govern its agent before building it. A
+tool type the adapter does not know passes through with a warning and is
+reported as ungoverned.
 
 ## CrewAI
 
@@ -211,7 +228,15 @@ schema whose `_run` / `_arun` admit the call first. A deny is returned as a
 tool that did not do what it was asked: the agent sees the reason, the
 failure is recorded on the task output, and the agent's `tool_failure_policy`
 decides whether to continue or abort. An `updated_input` from the edge
-replaces the arguments before the wrapped tool runs.
+replaces the arguments before the wrapped tool runs; a rewrite of several
+positional arguments must cover every one of them or the call is blocked.
+
+A governed tool never caches: CrewAI's tool cache would replay an earlier
+result for the same arguments without the edge judging the call again, so
+the inner tool's `cache_function` is not copied and the governed one always
+answers no. Govern a tool before its first run — the crew reads its cache by
+tool name before the tool is reached, so a result an ungoverned run of the
+same tool cached earlier would still be served.
 
 Coverage is what you hand it. Tools CrewAI adds to an agent on its own — the
 delegation tools, the code interpreter behind `allow_code_execution=True`,
@@ -264,7 +289,7 @@ ruff check . && ruff format --check . && mypy --strict && pytest
 
 Tests run against an in-process fake edge over a Unix socket; no MITRITY
 account and no network are needed. The conformance tests are numbered after
-the contract (`C1`–`C20`).
+the contract (`C1`–`C28`).
 
 ## Security
 
