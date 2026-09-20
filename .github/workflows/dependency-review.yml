@@ -222,33 +222,9 @@ jobs:
               --repo ${{ github.repository }} \
               --body-file comment.md
           fi
-
-      # Deterministic gate: auto-merge ONLY for patch bumps, and only with an APPROVE verdict.
-      - name: Queue auto-merge (patch bumps only)
-        if: success() && steps.semver.outputs.tier == 'patch'
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          VERDICT=$(cat verdict.txt 2>/dev/null || echo "COMMENT")
-
-          if [ "$VERDICT" != "APPROVE" ]; then
-            echo "Verdict is $VERDICT, skipping auto-merge"
-            exit 0
-          fi
-
-          echo "Patch bump approved by the review — queuing auto-merge for PR #${{ github.event.pull_request.number }}..."
-          for ATTEMPT in 1 2 3; do
-            if gh pr merge ${{ github.event.pull_request.number }} \
-              --repo ${{ github.repository }} \
-              --auto --squash 2>&1; then
-              echo "Auto-merge queued successfully"
-              exit 0
-            fi
-            echo "::warning::Auto-merge attempt $ATTEMPT/3 failed, retrying in 10s..."
-            sleep 10
-          done
-          echo "::warning::Auto-merge could not be queued after 3 attempts"
-
+      # Auto-merge is decided by .github/workflows/auto-merge.yml on the default
+      # branch: a patch bump approved here merges there; nothing is armed from this
+      # workflow, which holds no merge token.
       - name: Note skipped auto-merge (minor/major/unknown bumps)
         if: success() && steps.semver.outputs.tier != 'patch'
         env:

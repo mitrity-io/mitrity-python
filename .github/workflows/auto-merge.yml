@@ -1,44 +1,59 @@
 name: Auto-merge Gate
 
-# Arms (or disarms) auto-merge for a PR after a review agent finishes. It is a
-# workflow_run workflow: it executes the DEFAULT branch's definition and the
-# default branch's copy of .github/scripts/automerge-gate.sh, with the merge
-# token — so nothing a PR puts on its own head can arm its own merge. The
-# review workflows themselves hold no merge token.
+# Merges a PR once every required review agent has approved its current head
+# and GitHub reports the merge state CLEAN. It is a workflow_run workflow: it
+# executes the DEFAULT branch's definition and the default branch's copy of
+# .github/scripts/automerge-gate.sh, with the merge token — nothing a PR puts
+# on its own head reaches that token. The review workflows hold no merge token.
+#
+# Nothing is armed: the gate re-evaluates on every completion of a PR
+# workflow and merges with the head SHA pinned, so a merge can only happen for
+# the exact commit whose reviews it verified. It refuses PRs that change the
+# workflow or reviewer-instruction surface (.github/, .claude/, CLAUDE.md,
+# .mcp.json, action.yml): those are merged by hand. Dependabot PRs are left
+# to dependency-review.yml.
 #
 # Both review agents post as github-actions[bot], so GitHub's own review
 # decision only reflects whichever agent reviewed last; the gate script checks
-# the latest review of every required agent against the PR's current head and
-# disarms whenever that is not an approval.
+# the latest review of every required agent against the PR's current head.
 
 on:
   workflow_run:
-    workflows: ["Code Review Agent", "Security Review Agent"]
+    workflows: ["CI", "Code Review Agent", "Dependency Review Agent", "Security Review Agent"]
     types: [completed]
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
-  group: auto-merge-gate-${{ github.event.workflow_run.head_sha }}
+  group: auto-merge-gate-${{ join(github.event.workflow_run.pull_requests.*.number, '-') }}
   cancel-in-progress: false
 
 jobs:
   gate:
-    # Only review runs of pull requests from this repository carry a PR number;
-    # fork PRs never reach the merge token.
-    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.pull_requests[0] != null
+    # Only pull_request runs from this repository carry a PR number; the run
+    # must come from one of the base branch's PR workflow files (by path, not
+    # by name — a PR can name a workflow anything).
+    if: >-
+      github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.pull_requests[0] != null
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && contains(fromJSON('[".github/workflows/ci.yml", ".github/workflows/code-review.yml", ".github/workflows/dependency-review.yml", ".github/workflows/security-review.yml"]'), github.event.workflow_run.path)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
-      - name: Evaluate the reviews and arm or disarm auto-merge
+      - name: Evaluate the reviews and merge when everything is green at the same head
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBERS: ${{ join(github.event.workflow_run.pull_requests.*.number, ' ') }}
+          TRIGGER_PATH: ${{ github.event.workflow_run.path }}
         run: |
+          printf 'trigger: %s\n' "$TRIGGER_PATH"
           for PR in $PR_NUMBERS; do
             echo "== PR #$PR =="
             PR="$PR" bash .github/scripts/automerge-gate.sh
