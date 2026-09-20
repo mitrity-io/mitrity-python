@@ -257,7 +257,7 @@ fi
 # the time. Refusing every PR that predates a change to .github/ would force a
 # rebase and a full re-review of every open PR after each such change; where
 # that strictness is wanted, branch protection's "require branches to be up
-# to date" provides it mechanically (iag-infra and iag-agents use it).
+# to date" provides it mechanically (other MITRITY repositories use it).
 
 # ── the reviews at head ─────────────────────────────────────────────────────
 REVIEWS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
