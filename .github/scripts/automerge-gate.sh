@@ -60,6 +60,16 @@
 # step writes; see the threat model above for what that does and does not
 # cover.
 #
+# Reads on the merge path are retried before they refuse. A CLEAN merge state
+# means every check has completed, so the completion that reaches the merge
+# path is the PR's last: a read that fails there is not re-evaluated by a
+# later completion and the PR sits unmerged until the gate is rerun by hand
+# (#456, 2026-09-20). Three attempts, 5 s apart, and then the refusal stands
+# as before, with the last error in the log so the line says whether the
+# read was transient or the token cannot see the resource.
+#
+# Gate revision 8.
+#
 # Env: GH_TOKEN (PAT with merge rights), PR, REPO, DRY_RUN=1 to print the
 # decision without acting.
 set -uo pipefail
@@ -68,19 +78,43 @@ PR="${PR:?}"; REPO="${REPO:?}"; DRY_RUN="${DRY_RUN:-0}"
 say() { printf '%s\n' "$*" | tr -d '\000-\010\013-\037'; }          # script-authored lines only
 clean() { printf '%s' "$*" | tr -d '\000-\037' | cut -c1-200; }     # PR-influenced values: no newline can start a workflow command
 
+# Retried read for the merge path (see the header). Usage:
+#   retry_read VAR cmd args...
+# On the first attempt that exits 0, VAR holds the command's stdout and the
+# function returns 0. After three failures it returns 1 and READ_ERR holds
+# the last attempt's stderr as one line, sanitized the way clean() sanitizes
+# PR-influenced values (control characters removed, so no newline can start
+# a workflow command; capped at 300) and with anything shaped like a GitHub
+# token redacted, so the refusal can print it as its reason. stderr goes
+# through a file: a command substitution captures one stream, and the
+# caller's shell has to end up holding both.
+retry_read() {
+  local _var=$1 _out _err _n; shift
+  READ_ERR=""
+  _err=$(mktemp) || { READ_ERR="could not create a temporary file for stderr"; return 1; }
+  for _n in 1 2 3; do
+    if _out=$("$@" 2>"$_err"); then rm -f "$_err"; printf -v "$_var" '%s' "$_out"; return 0; fi
+    [ "$_n" -lt 3 ] && sleep 5
+  done
+  READ_ERR=$(tr -d '\000-\037' <"$_err" | sed -E 's/(gh[pousr]|github_pat)_[A-Za-z0-9_]{8,}/[redacted]/g' | cut -c1-300)
+  rm -f "$_err"
+  [ -n "$READ_ERR" ] || READ_ERR="no error output"
+  return 1
+}
+
 merge_now() {
   # The merge state is GitHub's own verdict on required checks, conflicts and
   # review requirements; it can be UNKNOWN for a moment after a push. It is
   # re-read immediately before every merge attempt so that a push or a check
   # that landed while the reviews were being evaluated is never merged over.
   for ATTEMPT in 1 2 3; do
-    MS=$(gh pr view "$PR" --repo "$REPO" --json mergeStateStatus,headRefOid --jq '"\(.mergeStateStatus) \(.headRefOid)"' 2>/dev/null) || MS=""
-    [ -n "$MS" ] || { say "::warning::Not merged: could not read the merge state of #$PR (API failure); the next completion re-evaluates"; return 0; }
+    retry_read MS gh pr view "$PR" --repo "$REPO" --json mergeStateStatus,headRefOid --jq '"\(.mergeStateStatus) \(.headRefOid)"' || { say "::warning::Not merged: could not read the merge state of #$PR after 3 attempts: $READ_ERR; the next completion re-evaluates"; return 0; }
+    [ -n "$MS" ] || { say "::warning::Not merged: the merge state of #$PR came back empty; the next completion re-evaluates"; return 0; }
     STATE=${MS%% *}; NOW_SHA=${MS##* }
     [ "$NOW_SHA" = "$HEAD_SHA" ] || { say "Not merged: the head moved from $HEAD_SHA to $(clean "$NOW_SHA") while evaluating"; return 0; }
     if [ "$STATE" = "UNKNOWN" ]; then [ "$ATTEMPT" -lt 3 ] && sleep 15; continue; fi
     if [ "$STATE" != "CLEAN" ]; then
-      ROLLUP=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '[.statusCheckRollup[] | select((.conclusion // "") != "SUCCESS" and (.conclusion // "") != "SKIPPED" and (.conclusion // "") != "NEUTRAL") | "\(.name // .context)=\(.conclusion // .status // "pending")"] | join(", ")' 2>/dev/null || true)
+      retry_read ROLLUP gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '[.statusCheckRollup[] | select((.conclusion // "") != "SUCCESS" and (.conclusion // "") != "SKIPPED" and (.conclusion // "") != "NEUTRAL") | "\(.name // .context)=\(.conclusion // .status // "pending")"] | join(", ")' || ROLLUP="checks unreadable after 3 attempts: $READ_ERR"
       say "::notice::Not merged: merge state is $(clean "$STATE") at $HEAD_SHA ($(clean "${ROLLUP:-no failing or pending checks listed}")); the next completion re-evaluates"
       return 0
     fi
@@ -92,14 +126,14 @@ merge_now() {
     # block that is absent or not enabled (a token that cannot see it, or a
     # branch governed by rulesets, which never appear here), and a protection
     # that names no required check at all.
-    BRANCH_JSON=$(gh api "repos/$REPO/branches/$BASE_REF" 2>&1) || { say "::warning::Not merged: could not read branch $BASE_REF: $(clean "$BRANCH_JSON")"; return 0; }
+    retry_read BRANCH_JSON gh api "repos/$REPO/branches/$BASE_REF" || { say "::warning::Not merged: could not read branch $BASE_REF after 3 attempts: $READ_ERR"; return 0; }
     PROT_ENABLED=$(printf '%s' "$BRANCH_JSON" | jq -r '.protection.enabled // false' 2>/dev/null) || PROT_ENABLED=""
     [ "$PROT_ENABLED" = "true" ] || { say "::warning::Not merged: branch protection on $BASE_REF is not visible to the merge token (enabled=$(clean "${PROT_ENABLED:-unreadable}"))"; return 0; }
     # Both spellings of the required list: checks[].context (current) and the
     # contexts mirror (kept for compatibility); a check named in either counts.
     REQUIRED_CTX=$(printf '%s' "$BRANCH_JSON" | jq -r '.protection.required_status_checks | select(type == "object") | (((.checks // []) | map(.context)) + (.contexts // [])) | map(select(type == "string" and length > 0)) | unique | .[]' 2>/dev/null) || REQUIRED_CTX=""
     [ -n "$REQUIRED_CTX" ] || { say "::warning::Not merged: branch protection on $BASE_REF names no required status check"; return 0; }
-    ROLLUP_JSON=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '.statusCheckRollup' 2>/dev/null) || { say "::warning::Not merged: could not read the checks"; return 0; }
+    retry_read ROLLUP_JSON gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '.statusCheckRollup' || { say "::warning::Not merged: could not read the checks after 3 attempts: $READ_ERR"; return 0; }
     MISSING=""
     # SKIPPED and NEUTRAL count as green on purpose: that is GitHub's own reading
     # of a required context whose job-level `if:` was false (a review workflow
