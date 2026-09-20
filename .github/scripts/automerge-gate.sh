@@ -186,9 +186,12 @@ if [ "$DEPENDABOT" = "1" ]; then
   TIER=unknown
   # Same rule as dependency-review.yml's classifier: a full X.Y.Z on both sides,
   # anything else is unknown and merged by hand.
-  if printf '%s' "$TITLE" | grep -qE '(^|: )[Bb]ump [^ ]+ from [0-9]+\.[0-9]+\.[0-9]+ to [0-9]+\.[0-9]+\.[0-9]+( in [^ ]+)?$'; then
-    OLD=$(printf '%s' "$TITLE" | sed -E 's/.* from ([0-9]+\.[0-9]+\.[0-9]+) to [0-9]+\.[0-9]+\.[0-9]+$/\1/')
-    NEW=$(printf '%s' "$TITLE" | sed -E 's/.* to ([0-9]+\.[0-9]+\.[0-9]+)$/\1/')
+  # The subject is the title without Dependabot's directory suffix (" in /dir"),
+  # so the guard and the two version extractions read the same string.
+  SUBJECT=$(printf '%s' "$TITLE" | sed -E 's/ in [^ ]+$//')
+  if printf '%s' "$SUBJECT" | grep -qE '(^|: )[Bb]ump [^ ]+ from [0-9]+\.[0-9]+\.[0-9]+ to [0-9]+\.[0-9]+\.[0-9]+$'; then
+    OLD=$(printf '%s' "$SUBJECT" | sed -E 's/.* from ([0-9]+\.[0-9]+\.[0-9]+) to [0-9]+\.[0-9]+\.[0-9]+$/\1/')
+    NEW=$(printf '%s' "$SUBJECT" | sed -E 's/.* to ([0-9]+\.[0-9]+\.[0-9]+)$/\1/')
     if [ "$(printf '%s' "$OLD" | cut -d. -f1)" != "$(printf '%s' "$NEW" | cut -d. -f1)" ]; then TIER=major
     elif [ "$(printf '%s' "$OLD" | cut -d. -f2)" != "$(printf '%s' "$NEW" | cut -d. -f2)" ]; then TIER=minor
     else TIER=patch; fi
