@@ -84,7 +84,7 @@ jobs:
             - No unnecessary dependencies added
             - Error handling is appropriate (every failure to obtain a decision is a deny, never an allow; no bare except that swallows a deny)
             - Variable/function naming is clear and consistent
-            - Public API matches iag-specs sentinel/adapters.md (names, semantics, attestation fields); runtime dependencies stay httpx-only
+            - Public API matches the adapter contract (https://mitrity.com/docs/integrations/adapters: names, semantics, attestation fields); runtime dependencies stay httpx-only
             - Type hints hold under mypy --strict and the change keeps Python 3.10 compatibility
 
             When you are done, return your result as the JSON object required by the schema: review_body (markdown) and verdict.

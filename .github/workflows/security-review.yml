@@ -97,7 +97,7 @@ jobs:
             - No secrets or credentials hardcoded; no new runtime dependencies beyond httpx
             - Async and sync paths enforce the same guarantees
 
-            Governed-execution invariants (iag-specs architecture/governed-execution.md, section "Invariants").
+            Governed-execution invariants (the "Invariants" section of the MITRITY governed-execution specification; the ones an adapter must uphold are restated below).
             Apply them whenever the diff touches src/mitrity (the admission client, the Claude Agent SDK
             hooks, the LangChain wrapper). A violation of any of them is HIGH:
             1. Judged bytes execute — the bytes a decision was made against are the bytes that run. A first-party
