@@ -12,7 +12,7 @@ honest coverage badge.
 - :mod:`mitrity.openai_agents` — ``govern()`` / ``govern_tools()`` for the OpenAI Agents SDK.
 - :mod:`mitrity.crewai` — ``govern()`` / ``govern_tools()`` for CrewAI tools.
 
-Contract: https://github.com/mitrity-io/iag-specs/blob/main/sentinel/adapters.md
+Contract: https://mitrity.com/docs/integrations/adapters
 """
 
 __version__ = "0.2.0"

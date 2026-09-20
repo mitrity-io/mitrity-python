@@ -44,7 +44,7 @@ dev = [
 [project.urls]
 Homepage = "https://mitrity.com"
 Source = "https://github.com/mitrity-io/mitrity-python"
-Contract = "https://github.com/mitrity-io/iag-specs/blob/main/sentinel/adapters.md"
+Contract = "https://mitrity.com/docs/integrations/adapters"
 
 [tool.hatch.version]
 path = "src/mitrity/__init__.py"

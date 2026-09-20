@@ -21,7 +21,7 @@ the fix ships. Coordinated disclosure is welcome; we ask for 90 days.
 
 Only the latest minor release receives security fixes. The admission protocol
 version an adapter release speaks is recorded in
-[iag-specs/sentinel/adapters.md](https://github.com/mitrity-io/iag-specs/blob/main/sentinel/adapters.md).
+[the adapter contract](https://mitrity.com/docs/integrations/adapters).
 
 ## What is and is not a vulnerability here
 

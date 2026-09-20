@@ -17,7 +17,7 @@ ENV_TOKEN_FILE = "MITRITY_ADMISSION_TOKEN_FILE"
 ENV_TIMEOUT = "MITRITY_HOOK_TIMEOUT"
 ENV_HOLD_TIMEOUT = "MITRITY_HOOK_HOLD_TIMEOUT"
 # Read for documentation's sake and deliberately ignored: adapters have no
-# fail-open mode (adapters.md, G2).
+# fail-open mode (the adapter contract, guarantee G2).
 ENV_FAIL_MODE = "MITRITY_HOOK_FAIL_MODE"
 
 DEFAULT_TIMEOUT = 0.5
