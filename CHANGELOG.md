@@ -8,7 +8,9 @@ tag needs a dated `## [X.Y.Z] - YYYY-MM-DD` section (see RELEASING.md).
 
 ## [Unreleased]
 
-## [0.1.0] - unreleased
+## [0.2.0] - 2026-09-20
+
+The first published version. It carries the four adapters and the wire client.
 
 ### Added
 
@@ -22,7 +24,15 @@ tag needs a dated `## [X.Y.Z] - YYYY-MM-DD` section (see RELEASING.md).
   attested on the first prompt of each session.
 - `mitrity.langchain`: `govern()` and `govern_tools()` wrap LangChain tools so
   every call is admitted before the tool runs.
+- `mitrity.openai_agents`: `govern()` and `govern_tools()` for the OpenAI Agents
+  SDK. Function tools get a tool input guardrail and a wrapped invoker that
+  applies the edge's `updated_input`; the shell and apply-patch tools go through
+  the SDK's approval flow; hosted tools and the computer tool pass through and are
+  attested as unhooked; handoff agents are governed with the same governor.
+- `mitrity.crewai`: `govern()` and `govern_tools()` for CrewAI. `GovernedTool`
+  keeps the inner tool's name, description, schema and policies, admits every
+  call first, and returns CrewAI's `ToolFailure` with the edge's reason on a deny.
 - Conformance tests `C1`–`C20` against an in-process fake edge.
 
-[Unreleased]: https://github.com/mitrity-io/mitrity-python/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/mitrity-io/mitrity-python/releases/tag/v0.1.0
+[Unreleased]: https://github.com/mitrity-io/mitrity-python/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mitrity-io/mitrity-python/releases/tag/v0.2.0
