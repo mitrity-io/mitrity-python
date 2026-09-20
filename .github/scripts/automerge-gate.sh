@@ -45,10 +45,24 @@
 #
 # Merging is verified, not assumed: the PR's merge state must be CLEAN (every
 # required check green, no conflict) at the verified head, and every status
-# check that branch protection requires is read back green from the checks
-# themselves. The merge token is a fine-grained token with contents and
-# pull-request rights and no administration permission; the gate does not
-# rely on that, it verifies. Dependabot PRs are left to their own gate.
+# check that branch protection requires is read back green from the workflow
+# jobs behind it, through the Actions API. The checks come from the Actions
+# API because the merge token cannot read the check-run rollup: it is a
+# fine-grained token with contents, pull-request and Actions (read) rights,
+# GitHub offers it no Checks permission, and GraphQL's statusCheckRollup
+# fails on it deterministically (revision 8's diagnostic line, 2026-09-20),
+# while the runs and jobs at the head are Actions reads. Only pull_request
+# runs count, the one event auto-merge.yml itself trusts: a push or
+# workflow_dispatch run at the same head, whose jobs may carry the same
+# names as ci.yml's (deploy-dev.yml does), can neither vouch for a required
+# context nor outrank a CI job of the same name. A required context that is
+# not a pull_request Actions job (a commit status posted by an app; a job of
+# a workflow_run or pull_request_target workflow, whose run has another
+# head) has no job at the head, reads as absent and the gate refuses: that
+# is the fail-closed direction, and such a PR is merged by hand. The token
+# has no
+# administration permission; the gate does not rely on that, it verifies.
+# Dependabot PRs are left to their own gate.
 #
 # Whether the security agent is required is derived from facts a PR cannot
 # influence from its branch: the base branch's security-review.yml path filter
@@ -68,7 +82,7 @@
 # as before, with the last error in the log so the line says whether the
 # read was transient or the token cannot see the resource.
 #
-# Gate revision 8.
+# Gate revision 10.
 #
 # Env: GH_TOKEN (PAT with merge rights), PR, REPO, DRY_RUN=1 to print the
 # decision without acting.
@@ -102,6 +116,49 @@ retry_read() {
   return 1
 }
 
+# The workflow jobs at the head, read through the Actions API (see the
+# header): every pull_request workflow run whose head is HEAD_SHA, then
+# every job of every attempt of each run (filter=all, so a re-run leaves the
+# superseded attempt visible and the evaluation can pick the latest). Both
+# listings page. On success JOBS_JSON holds one JSON array of
+# {run_id, run_attempt, id, name, status, conclusion}; on failure the
+# function returns 1 with READ_ERR set the way retry_read sets it, prefixed
+# with the read that failed. The head SHA and the run ids are interpolated
+# into URLs, so a value of the wrong shape is a refusal, not a request; the
+# ids are read line by line, never word-split or glob-expanded.
+read_head_jobs() {
+  local _run _ids _jobs _all=""
+  JOBS_JSON=""
+  case "$HEAD_SHA" in ''|*[!0-9a-f]*) READ_ERR="unexpected head SHA '$(clean "$HEAD_SHA")'"; return 1;; esac
+  retry_read _ids gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" --paginate --jq '.workflow_runs[].id' || { READ_ERR="listing the runs: $READ_ERR"; return 1; }
+  while IFS= read -r _run; do
+    [ -n "$_run" ] || continue
+    case "$_run" in *[!0-9]*) READ_ERR="unexpected run id '$(clean "$_run")' in the run listing"; return 1;; esac
+    retry_read _jobs gh api "repos/$REPO/actions/runs/$_run/jobs?filter=all&per_page=100" --paginate --jq '.jobs[] | {run_id, run_attempt, id, name, status, conclusion}' </dev/null || { READ_ERR="run $_run: $READ_ERR"; return 1; }
+    _all="$_all$_jobs"$'\n'
+  done <<EOF_RUNS
+$_ids
+EOF_RUNS
+  JOBS_JSON=$(printf '%s' "$_all" | jq -sc '.') || { READ_ERR="the job listing did not parse as JSON"; JOBS_JSON=""; return 1; }
+}
+
+# The latest job of a name decides for that name: highest run_id, then
+# run_attempt, then id, so a re-run of a failed job supersedes the failure
+# and a newer run supersedes an older one. Conclusions are the Actions API's
+# (lowercase). success, skipped and neutral are green on purpose: skipped and
+# neutral are GitHub's own reading of a required context whose job-level
+# `if:` was false (a review workflow that skips Dependabot PRs); the
+# review-identity check, not this rule, is what requires the agents'
+# approvals. A name with no job at the head (never run, or a commit status
+# rather than an Actions job) is "absent"; a job still running has no
+# conclusion and shows its status instead. Everything else (failure,
+# cancelled, timed_out, action_required, ...) is its conclusion, verbatim.
+# Two jq definitions, prepended to every program that applies the rule.
+JOB_RULE='def latest: sort_by([.run_id, .run_attempt, .id]) | last;
+  def verdict: if . == null then "absent"
+    elif (.conclusion // "") == "success" or (.conclusion // "") == "skipped" or (.conclusion // "") == "neutral" then "ok"
+    else (.conclusion // .status // "pending") end;'
+
 merge_now() {
   # The merge state is GitHub's own verdict on required checks, conflicts and
   # review requirements; it can be UNKNOWN for a moment after a push. It is
@@ -114,18 +171,23 @@ merge_now() {
     [ "$NOW_SHA" = "$HEAD_SHA" ] || { say "Not merged: the head moved from $HEAD_SHA to $(clean "$NOW_SHA") while evaluating"; return 0; }
     if [ "$STATE" = "UNKNOWN" ]; then [ "$ATTEMPT" -lt 3 ] && sleep 15; continue; fi
     if [ "$STATE" != "CLEAN" ]; then
-      retry_read ROLLUP gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '[.statusCheckRollup[] | select((.conclusion // "") != "SUCCESS" and (.conclusion // "") != "SKIPPED" and (.conclusion // "") != "NEUTRAL") | "\(.name // .context)=\(.conclusion // .status // "pending")"] | join(", ")' || ROLLUP="checks unreadable after 3 attempts: $READ_ERR"
-      say "::notice::Not merged: merge state is $(clean "$STATE") at $HEAD_SHA ($(clean "${ROLLUP:-no failing or pending checks listed}")); the next completion re-evaluates"
+      # Explanation only (the state already refused): every job name whose
+      # latest job at the head is not green, from the same Actions data.
+      if read_head_jobs; then
+        NOT_GREEN=$(printf '%s' "$JOBS_JSON" | jq -r "$JOB_RULE"' [group_by(.name)[] | latest | verdict as $v | select($v != "ok") | "\(.name)=\($v)"] | join(", ")') || NOT_GREEN="the job listing did not evaluate"
+      else NOT_GREEN="workflow jobs unreadable after 3 attempts: $READ_ERR"; fi
+      say "::notice::Not merged: merge state is $(clean "$STATE") at $HEAD_SHA ($(clean "${NOT_GREEN:-no failing or pending jobs listed}")); the next completion re-evaluates"
       return 0
     fi
     # The merge state is not the only witness: every status check that branch
-    # protection requires must be green at this head, read from the checks
-    # themselves. The required contexts come from the branch object, which
-    # read access can see (the branch-protection endpoints need administration
-    # rights). Every degraded case is a refusal: an API error, a protection
-    # block that is absent or not enabled (a token that cannot see it, or a
-    # branch governed by rulesets, which never appear here), and a protection
-    # that names no required check at all.
+    # protection requires must be green at this head, read from the workflow
+    # jobs behind it (read_head_jobs; see the header). The required contexts
+    # come from the branch object, which read access can see (the
+    # branch-protection endpoints need administration rights). Every degraded
+    # case is a refusal: an API error, a protection block that is absent or
+    # not enabled (a token that cannot see it, or a branch governed by
+    # rulesets, which never appear here), a protection that names no required
+    # check at all, and runs or jobs that cannot be read.
     retry_read BRANCH_JSON gh api "repos/$REPO/branches/$BASE_REF" || { say "::warning::Not merged: could not read branch $BASE_REF after 3 attempts: $READ_ERR"; return 0; }
     PROT_ENABLED=$(printf '%s' "$BRANCH_JSON" | jq -r '.protection.enabled // false' 2>/dev/null) || PROT_ENABLED=""
     [ "$PROT_ENABLED" = "true" ] || { say "::warning::Not merged: branch protection on $BASE_REF is not visible to the merge token (enabled=$(clean "${PROT_ENABLED:-unreadable}"))"; return 0; }
@@ -133,15 +195,13 @@ merge_now() {
     # contexts mirror (kept for compatibility); a check named in either counts.
     REQUIRED_CTX=$(printf '%s' "$BRANCH_JSON" | jq -r '.protection.required_status_checks | select(type == "object") | (((.checks // []) | map(.context)) + (.contexts // [])) | map(select(type == "string" and length > 0)) | unique | .[]' 2>/dev/null) || REQUIRED_CTX=""
     [ -n "$REQUIRED_CTX" ] || { say "::warning::Not merged: branch protection on $BASE_REF names no required status check"; return 0; }
-    retry_read ROLLUP_JSON gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '.statusCheckRollup' || { say "::warning::Not merged: could not read the checks after 3 attempts: $READ_ERR"; return 0; }
+    read_head_jobs || { say "::warning::Not merged: could not read the workflow jobs after 3 attempts: $READ_ERR"; return 0; }
     MISSING=""
-    # SKIPPED and NEUTRAL count as green on purpose: that is GitHub's own reading
-    # of a required context whose job-level `if:` was false (a review workflow
-    # that skips Dependabot PRs); the review-identity check above, not this
-    # loop, is what requires the agents' approvals.
+    # One verdict per required context, by JOB_RULE; a verdict that cannot be
+    # computed is a refusal too.
     while IFS= read -r CTX; do
       [ -n "$CTX" ] || continue
-      OK=$(printf '%s' "$ROLLUP_JSON" | jq -r --arg c "$CTX" '[.[] | select((.name // .context) == $c) | (.conclusion // .state // "")] | if length == 0 then "absent" elif all(. == "SUCCESS" or . == "SKIPPED" or . == "NEUTRAL") then "ok" else join(",") end')
+      OK=$(printf '%s' "$JOBS_JSON" | jq -r --arg c "$CTX" "$JOB_RULE"' [.[] | select(.name == $c)] | latest | verdict') || OK=unreadable
       [ "$OK" = "ok" ] || MISSING="$MISSING $CTX=$OK"
     done <<EOF_CTX
 $REQUIRED_CTX
