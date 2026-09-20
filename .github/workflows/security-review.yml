@@ -172,7 +172,7 @@ jobs:
             cat review.md
             echo ""
             echo "---"
-            echo "*Automated review by Security Review Agent (claude-opus-5 via Claude Code) · [docs](https://github.com/mitrity-io/iag-config)*"
+            echo "*Automated review by Security Review Agent (claude-opus-5 via Claude Code)*"
           } > comment.md
 
           if [ "$(wc -c < comment.md)" -gt 65000 ]; then
