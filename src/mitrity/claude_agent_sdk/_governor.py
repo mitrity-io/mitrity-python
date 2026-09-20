@@ -7,8 +7,9 @@ edge's admission API before the SDK runs it, a ``PostToolUse`` hook that keeps
 the coverage claim honest, and an attestation of the runtime's posture sent at
 session start.
 
-Every guarantee in iag-specs ``sentinel/adapters.md`` is implemented here, and
-the numbering in the comments refers to it.
+Every guarantee in the adapter contract
+(https://mitrity.com/docs/integrations/adapters) is implemented here, and the
+guarantee numbers in the comments (G1–G11) refer to it.
 """
 
 from __future__ import annotations
@@ -162,7 +163,8 @@ class Governor:
         sources: list[str] | None = None if raw_sources is None else [str(s) for s in raw_sources]
         if not strict:
             # Servers those files add are ungoverned paths this adapter did not
-            # enumerate; naming the gap is the honest attestation (adapters.md G6).
+            # enumerate; naming the gap is the honest attestation (the adapter
+            # contract, guarantee G6).
             for source in sources if sources is not None else ALL_SETTING_SOURCES:
                 other.append(f"settings:{source}")
 
@@ -223,12 +225,12 @@ class Governor:
     def _budgets(self) -> tuple[float, float]:
         """The hold budget one decision may spend, and the matcher timeout that contains it.
 
-        The adapter must be the one that answers (adapters.md G3), so every term
-        it can spend inside one PreToolUse — the attestation, the decision
-        deadline, the hold wait, the hold margin — plus slack has to fit under
-        the framework's own 600 s hook budget. The hold budget is what gives
-        when it does not: waiting less on a human is a deny the operator can
-        see; a hook the framework kills is a decision nobody made.
+        The adapter must be the one that answers (the adapter contract, guarantee
+        G3), so every term it can spend inside one PreToolUse — the attestation,
+        the decision deadline, the hold wait, the hold margin — plus slack has to
+        fit under the framework's own 600 s hook budget. The hold budget is what
+        gives when it does not: waiting less on a human is a deny the operator
+        can see; a hook the framework kills is a decision nobody made.
         """
         cfg = self._client.config
         fixed = ATTEST_TIMEOUT + cfg.timeout + HOLD_MARGIN + _HOOK_SLACK
@@ -364,7 +366,7 @@ class Governor:
             if verdict.updated_input is not None:
                 # Routed (or rewritten): the merged input is what runs, and the
                 # explicit allow keeps a human from being prompted about a relay
-                # command that carries a ticket (adapters.md G10).
+                # command that carries a ticket (the adapter contract, guarantee G10).
                 self.stats.routed += 1
                 merged = {**tool_input, **verdict.updated_input}
                 if verdict.routed_to:
@@ -464,7 +466,7 @@ def _optional_str(value: Any) -> str | None:
 
 def _allow() -> SyncHookJSONOutput:
     # Silent: no permissionDecision, so the developer's own permission flow
-    # continues unchanged (adapters.md G10).
+    # continues unchanged (the adapter contract, guarantee G10).
     return {}
 
 

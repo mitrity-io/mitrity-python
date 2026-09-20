@@ -1,7 +1,7 @@
 """The MITRITY admission client.
 
-Contract: https://github.com/mitrity-io/iag-specs/blob/main/sentinel/admission-api.md
-Adapter guarantees: https://github.com/mitrity-io/iag-specs/blob/main/sentinel/adapters.md
+Contract: https://mitrity.com/docs/integrations/admission-api
+Adapter guarantees: https://mitrity.com/docs/integrations/adapters
 """
 
 from ._canonical import canonical_json, config_hash

@@ -6,8 +6,8 @@ install, so the adapter wraps the tools: ``govern(agent)`` returns a clone of
 the agent whose tools ask the MITRITY edge first, ``govern_tools(tools)`` does
 the same for a list.
 
-Each tool type is refused the way the SDK itself refuses that type
-(iag-specs ``sentinel/adapters.md``, "OpenAI Agents SDK"):
+Each tool type is refused the way the SDK itself refuses that type (the
+adapter contract, "OpenAI Agents SDK" — https://mitrity.com/docs/integrations/adapters):
 
 - a ``FunctionTool`` gets a tool input guardrail whose ``reject_content``
   carries the edge's reason to the model and keeps the tool from running, and

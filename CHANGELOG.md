@@ -8,6 +8,14 @@ tag needs a dated `## [X.Y.Z] - YYYY-MM-DD` section (see RELEASING.md).
 
 ## [Unreleased]
 
+### Changed
+
+- The README, `SECURITY.md`, the docstrings and the `Contract` project URL link
+  to the public adapter contract and admission API pages
+  (https://mitrity.com/docs/integrations/adapters and
+  https://mitrity.com/docs/integrations/admission-api) instead of the
+  specification repository.
+
 ## [0.2.0] - 2026-09-20
 
 The first published version. It carries the four adapters and the wire client.

@@ -1,9 +1,10 @@
 """An in-process fake of the admission API, served over a Unix socket.
 
-It speaks exactly the wire shape of iag-specs ``sentinel/admission-api.md``
-and nothing more: token header, version header, ``/v1/admit``, ``/v1/attest``,
-``/healthz``. Responses are scripted per test; every request is recorded so a
-test can assert what the adapter sent — and, just as often, what it did not.
+It speaks exactly the wire shape of the admission API
+(https://mitrity.com/docs/integrations/admission-api) and nothing more: token
+header, version header, ``/v1/admit``, ``/v1/attest``, ``/healthz``. Responses
+are scripted per test; every request is recorded so a test can assert what the
+adapter sent — and, just as often, what it did not.
 """
 
 from __future__ import annotations

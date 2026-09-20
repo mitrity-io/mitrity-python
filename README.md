@@ -12,8 +12,8 @@ runs**, with the same policy rules, command analysis, DLP and holds an MCP call
 gets, and the same audit trail (`surface=agent_hook`). If the edge cannot be
 reached, the call is denied — there is no fail-open mode.
 
-Contract: [iag-specs/sentinel/adapters.md](https://github.com/mitrity-io/iag-specs/blob/main/sentinel/adapters.md)
-(wire protocol: [sentinel/admission-api.md](https://github.com/mitrity-io/iag-specs/blob/main/sentinel/admission-api.md)).
+This package implements the [adapter contract](https://mitrity.com/docs/integrations/adapters)
+over the [admission API](https://mitrity.com/docs/integrations/admission-api) wire protocol.
 
 ## Install
 
