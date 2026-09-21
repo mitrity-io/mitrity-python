@@ -11,7 +11,7 @@ name: Release
 # The OIDC token is only minted in publish, which runs no project or third-party
 # code: no checkout, no pip install, only the download of build's artifacts. The
 # release comes last, so nothing is announced for a version that failed to publish.
-# The founder checklist and the per-release steps are in RELEASING.md.
+# The maintainer checklist and the per-release steps are in RELEASING.md.
 
 on:
   push:

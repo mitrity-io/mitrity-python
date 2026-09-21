@@ -16,7 +16,9 @@ jobs:
     if: github.actor != 'dependabot[bot]'
     steps:
       # The review needs CLAUDE_CODE_OAUTH_TOKEN (a Claude Code subscription token
-      # from `claude setup-token`). Fail loudly when it is missing instead of
+      # from `claude setup-token`, set as an org Actions secret: `gh secret set
+      # CLAUDE_CODE_OAUTH_TOKEN --org mitrity-io --visibility all`). Fail loudly when it
+      # is missing instead of
       # reporting a green check with no review posted.
       - name: Check credentials
         env:
@@ -27,7 +29,7 @@ jobs:
             echo "::error::CLAUDE_CODE_OAUTH_TOKEN is not set"
             gh pr comment "${{ github.event.pull_request.number }}" \
               --repo "${{ github.repository }}" \
-              --body "⚠️ **Code Review Agent could not run** — \`CLAUDE_CODE_OAUTH_TOKEN\` is not available in this PR's secret store. Set it as an org Actions secret: \`gh secret set CLAUDE_CODE_OAUTH_TOKEN --org mitrity-io --visibility all\` (generate the value locally with \`claude setup-token\`), then re-run this workflow."
+              --body "⚠️ **Code Review Agent could not run** — its credentials are not available to this workflow run. A maintainer will restore them and re-run the workflow."
             exit 1
           fi
 
@@ -124,7 +126,7 @@ jobs:
             echo "::error::Code Review Agent produced no verdict (action outcome: $REVIEW_OUTCOME)"
             gh pr comment "${{ github.event.pull_request.number }}" \
               --repo "${{ github.repository }}" \
-              --body "⚠️ **Code Review Agent could not produce a review** (action outcome: \`$REVIEW_OUTCOME\`). Common causes: an expired \`CLAUDE_CODE_OAUTH_TOKEN\` (regenerate with \`claude setup-token\`) or the Claude subscription's usage window being exhausted. Re-run the workflow once resolved — this PR needs a review before it can merge."
+              --body "⚠️ **Code Review Agent could not produce a review** (action outcome: \`$REVIEW_OUTCOME\`). A maintainer will re-run the workflow; this PR needs a review before it can merge."
             exit 1
           fi
           printf '%s' "$REVIEW_JSON" | jq -r '.review_body' > review.md
@@ -144,7 +146,7 @@ jobs:
             cat review.md
             echo ""
             echo "---"
-            echo "*Automated review by Code Review Agent (claude-opus-5 via Claude Code)*"
+            echo "*Automated review by MITRITY's Code Review Agent*"
           } > comment.md
 
           if [ "$(wc -c < comment.md)" -gt 65000 ]; then

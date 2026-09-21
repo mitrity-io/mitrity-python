@@ -8,7 +8,7 @@ workflow's OIDC token; no API token exists anywhere), and creates the GitHub
 Release with the version's CHANGELOG section as notes and the distributions
 attached.
 
-## One-time setup (founder)
+## One-time setup (maintainer)
 
 1. **PyPI account**: two-factor authentication enabled on the account that will
    own the project.
